@@ -158,7 +158,10 @@ export function computeAvailabilityBlocks({
       clamped.push({ startMs, endMs });
     }
 
-    mergedBusyByUser.set(userId, mergeIntervals(clamped));
+    const merged = mergeIntervals(clamped);
+    if (merged.length > 0) {
+      mergedBusyByUser.set(userId, merged); // only store if non-empty
+    }
   }
 
   // Block iteration with per-user pointers (fast enough for MVP).
