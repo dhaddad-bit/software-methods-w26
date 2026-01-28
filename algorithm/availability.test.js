@@ -308,7 +308,7 @@ describe('Algorithm Module: Simple Availability (MVP)', () => {
 
   // =================================================================
   // USE CASE 5: Group Availability & Fractions
-  // Requirement: Calculate what % of the group is free (for heatmaps).
+  // Requirement: Calculate what % of the group is free (for maybe heatmaps of fairness SPIRAL).
   // =================================================================
   describe('Group Aggregation', () => {
     test('should calculate correct availability fraction for mixed group', () => {

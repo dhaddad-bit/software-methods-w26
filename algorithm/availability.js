@@ -31,12 +31,13 @@ export const BlockingLevel = Object.freeze({
  * @property {string} [blockingLevel] - one of BlockingLevel (ignored in MVP)
  */
 
+
 /**
- * One participant’s snapshot.
  * @typedef {Object} ParticipantSnapshot
  * @property {UserId} userId
  * @property {EventInterval[]} events
  */
+
 
 /**
  * Output: availability for one fixed-size block [startMs, endMs)
