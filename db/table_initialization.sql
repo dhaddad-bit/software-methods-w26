@@ -1,0 +1,40 @@
+CREATE TABLE IF NOT EXISTS 
+person (
+	user_id INTEGER PRIMARY KEY,
+	first_name VARCHAR(50),
+	last_name VARCHAR(50),
+	username VARCHAR(12),
+	email VARCHAR(25),
+	google_user_id VARCHAR(255)
+);
+
+CREATE TABLE IF NOT EXISTS
+f_group (
+	group_id INTEGER PRIMARY KEY,
+	group_name VARCHAR(50)
+);
+
+CREATE TABLE IF NOT EXISTS
+group_match (
+	group_id INTEGER NOT NULL REFERENCES f_group (group_id),
+	user_id INTEGER NOT NULL REFERENCES person (user_id),
+	PRIMARY KEY (group_id, user_id)
+);
+
+CREATE TABLE IF NOT EXISTS
+calendar (
+	-- i think this is internal calendar id
+	calendar_id INTEGER PRIMARY KEY,
+	gcal_id VARCHAR(255),
+	-- unknown if needed
+	calendar_name VARCHAR(100)
+);
+
+CREATE TABLE IF NOT EXISTS
+cal_event (
+	event_id INTEGER PRIMARY KEY,
+	calendar_id INTEGER NOT NULL REFERENCES calendar (calendar_id),
+	priority INTEGER,
+	event_start TIMESTAMPTZ,
+	event_duration FLOAT -- in hours
+);
