@@ -1,5 +1,9 @@
 // availability.test.js
-import { computeAvailabilityBlocks, DEFAULT_G_MINUTES } from './availability';
+import { computeAvailabilityBlocks, DEFAULT_G_MINUTES } from './algorithm';
+import { BlockingLevel } from './types/algorithm_types';
+/** @typedef {import("./types/algorithm_types.js").UserId} UserId */
+/** @typedef {import("./types/algorithm_types.js").ParticipantSnapshot} ParticipantSnapshot */
+/** @typedef {import("./types/algorithm_types.js").AvailabilityBlock} AvailabilityBlock */
 
 // --- Test Data Helpers ---
 // A fixed base time to make math easy (e.g., 10:00 AM UTC)

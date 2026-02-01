@@ -1,56 +1,11 @@
 // availability.js
 // ES module exports: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Guide/Modules :contentReference[oaicite:6]{index=6}
 
-/** Global default block size (minutes). */
-export const DEFAULT_G_MINUTES = 15;
+import { DEFAULT_G_MINUTES, BlockingLevel } from "./types/algorithm_types.js";
 
-/**
- * "Enum" pattern in JS.
- * (In TS this becomes: enum BlockingLevel { B1, B2, B3 })
- */
-export const BlockingLevel = Object.freeze({
-  B1: "B1",
-  B2: "B2",
-  B3: "B3", // MVP default: treat as highest
-});
-
-/**
- * @typedef {string} UserId
- */
-
-/**
- * An interval on a timeline (half-open): [startMs, endMs)
- * Times are UTC epoch milliseconds.
- *
- * @typedef {Object} EventInterval
- * @property {string} eventRef - Identifier (Google event id, DB id, etc.)
- * @property {UserId} userId
- * @property {number} startMs
- * @property {number} endMs
- * @property {string} [source] - e.g. "GOOGLE" | "TIMEBLOCK" | "PETITION"
- * @property {string} [blockingLevel] - one of BlockingLevel (ignored in MVP)
- */
-
-
-/**
- * @typedef {Object} ParticipantSnapshot
- * @property {UserId} userId
- * @property {EventInterval[]} events
- */
-
-
-/**
- * Output: availability for one fixed-size block [startMs, endMs)
- * @typedef {Object} AvailabilityBlock
- * @property {number} startMs
- * @property {number} endMs
- * @property {UserId[]} freeUserIds
- * @property {UserId[]} busyUserIds
- * @property {number} availableCount
- * @property {number} busyCount
- * @property {number} totalCount
- * @property {number} availabilityFraction
- */
+/** @typedef {import("./types/algorithm_types.js").UserId} UserId */
+/** @typedef {import("./types/algorithm_types.js").ParticipantSnapshot} ParticipantSnapshot */
+/** @typedef {import("./types/algorithm_types.js").AvailabilityBlock} AvailabilityBlock */
 
 /**
  * Merge overlapping/adjacent intervals for ONE user.
@@ -59,19 +14,24 @@ export const BlockingLevel = Object.freeze({
  * @param {{startMs:number,endMs:number}[]} intervals
  * @returns {{startMs:number,endMs:number}[]}
  */
+
+// TODO must change when implementing priority (overlapping events default block to highest given priority
+// one priority per event interval)
 function mergeIntervals(intervals) {
+  // simple case: make a copy: avoid mutating caller's array
   if (intervals.length <= 1) return intervals.slice();
 
-  // MDN sort: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Array/sort :contentReference[oaicite:7]{index=7}
+  // https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Array/sort
+  // Sort by startMs (ascending). Sort a copy so the caller's array isn't mutated.
+  // a.startMs - b.startMs returns negative when a.startMs < b.startMs (i.e. a before b)
   const sorted = intervals.slice().sort((a, b) => a.startMs - b.startMs);
-
+  
   /** @type {{startMs:number,endMs:number}[]} */
   const merged = [];
   let cur = { startMs: sorted[0].startMs, endMs: sorted[0].endMs };
 
   for (let i = 1; i < sorted.length; i++) {
     const next = sorted[i];
-    // "Adjacent counts as merged" is a design choice; good for block math.
     // ALTERED: changed to "<" from "<=" to keep exact boundaries
     if (next.startMs < cur.endMs) {
       cur.endMs = Math.max(cur.endMs, next.endMs);
