@@ -1,9 +1,11 @@
 // server.js
 const express = require('express');
 const { Pool } = require('pg');
+const cors = require('cors')
 require('dotenv').config();
 
 const app = express();
+app.use(cors()); // this is just for development - do origin, credentials when deployed
 const PORT = process.env.PORT || 3000;
 
 // Database connection
