@@ -1,0 +1,4 @@
+.env
+node_modules/
+backend/oauth-test/secrets/
+backend/oauth-test/public/events.txt
