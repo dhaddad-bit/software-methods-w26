@@ -114,9 +114,11 @@ app.get('/health', (req, res) => {
 
 app.get('/auth/google', async (req, res) => {
 // Generate a secure random state value.
+  const username = req.query.username;
   const state = crypto.randomBytes(32).toString('hex');
   // Store state in the session
   req.session.state = state;
+  req.session.pending_username = username;
 
   // Generate a url that asks permissions for the Drive activity and Google Calendar scope
   const authorizationUrl = oauth2Client.generateAuthUrl({
@@ -155,12 +157,21 @@ app.get('/oauth2callback', async (req, res) => {
     const {data: userInfo} = await oauth2.userinfo.get();
 
     const userId = db.insertUpdateUser(
-      userInfo.id, userInfo.email, userInfo.given_name, userInfo.family_name, tokens.refresh_token, tokens.access_token, tokens.expiry_date
+      userInfo.id,
+      userInfo.email, 
+      userInfo.given_name, 
+      userInfo.family_name, 
+      req.session.pending_username,
+      tokens.refresh_token, 
+      tokens.access_token, 
+      tokens.expiry_date
     );
 
     req.session.userId = userId;
     req.session.isAuthenticated = true;
+
     delete req.session.state;
+    delete req.session.pending_username;
 
     req.session.save((saveErr) => {
       if (saveErr) {
