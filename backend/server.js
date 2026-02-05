@@ -136,7 +136,8 @@ app.get('/auth/google', async (req, res) => {
     // Enable incremental authorization. Recommended as a best practice.
     include_granted_scopes: true,
     // Include the state parameter to reduce the risk of CSRF attacks.
-    state: state
+    state: state,
+    prompt:"consent"
   });
   res.redirect(authorizationUrl);
 });
@@ -280,6 +281,14 @@ app.get("/api/events", async (req, res) => {
     res.status(500).json({ error: "Failed to fetch events" });
   }
 });
+
+app.get('/api/me', async (req, res) => {
+  if (req.session.userId) {
+    const person_info = await db.getUserByID(req.session.userId);
+    res.json(person_info);
+  }
+  res.json("");
+}) 
 
 app.listen(PORT, async () => {
   console.log(`Server running on port ${PORT}`);

@@ -1,6 +1,3 @@
-// temp fix: added the backend url to the apiget function
-
-
 export async function apiGet(path) {
   const response = await fetch(path, {
     credentials: "include"
