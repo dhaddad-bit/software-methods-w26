@@ -25,16 +25,16 @@ const createUser = async(email, fname, lname, username) => {
     return result.rows[0];
 };
 
-const insertUpdateUser = async(google_id, email, first_name, last_name, refresh_token, access_token, token_expiry) => {
+const insertUpdateUser = async(google_id, email, first_name, last_name, username, refresh_token, access_token, token_expiry) => {
     
     const result = await pool.query( `
         INSERT INTO person (google_id, email, first_name, last_name, refresh_token, access_token, token_expiry)
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
         ON CONFLICT (google_id)
         DO UPDATE SET 
-            refresh_token = $5,
-            access_token = $6,
-            token_expiry = $7,
+            refresh_token = $6,
+            access_token = $7,
+            token_expiry = $8,
             updated_at = NOW()
         RETURNING google_id`,
         [   
@@ -42,6 +42,7 @@ const insertUpdateUser = async(google_id, email, first_name, last_name, refresh_
             email,
             first_name,
             last_name,
+            username,
             refresh_token,
             access_token,
             new Date(token_expiry)
@@ -63,7 +64,6 @@ const getUserByID = async(user_id) => {
 // get users from group
 // check if user already in db
 // get stored events from a user
-
 
 const getUsersWithName = async(name) => {
     console.log('running q');
