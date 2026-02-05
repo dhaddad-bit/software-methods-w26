@@ -34,7 +34,8 @@ app.use(session({
     httpOnly: true,
     sameSite: 'lax',
     secure: isProduction,
-    maxAge: 24*60*60*1000
+    maxAge: 24*60*60*1000,
+    path: '/'
   }
 }));
 
@@ -90,17 +91,6 @@ app.get('api/me', (req, res) => {
   return res.json( { loggedIn: true }); // go to calendar view
 });
 
-// app.get('/', (req, res) => {
-//   // Check if user has tokens
-//   if (req.session.tokens) {
-//     // Authorized: Serve the main app
-//     res.sendFile(path.join(__dirname, "..", "frontend", "index.html"));
-//   } else {
-//     // Unauthorized: Send them to login
-//     res.redirect('/login');
-//   }
-// });
-
 
 app.get('/logout', (req, res) => {
   req.session.destroy((err) => {
@@ -139,23 +129,15 @@ app.get('/auth/google', async (req, res) => {
   req.session.state = state;
   req.session.pending_username = username;
 
-  // force a session save before redirect
-  req.session.save((err) => {
-    if (err) {
-      console.error('session save error:', err);
-      return res.status(500).send('session error');
-    }
-    const authorizationUrl = oauth2Client.generateAuthUrl({
-      access_type: 'offline',
-      scope: scopes,
-      // Enable incremental authorization. Recommended as a best practice.
-      include_granted_scopes: true,
-      // Include the state parameter to reduce the risk of CSRF attacks.
-      state: state
-    });
-    res.redirect(authorizationUrl);
+  const authorizationUrl = oauth2Client.generateAuthUrl({
+    access_type: 'offline',
+    scope: scopes,
+    // Enable incremental authorization. Recommended as a best practice.
+    include_granted_scopes: true,
+    // Include the state parameter to reduce the risk of CSRF attacks.
+    state: state
   });
-  
+  res.redirect(authorizationUrl);
 });
 
 app.get('/oauth2callback', async (req, res) => {
@@ -170,9 +152,6 @@ app.get('/oauth2callback', async (req, res) => {
   // if (q.state !== req.session.state) {
   //   return res.status(403).send('State mismatch. Possible CSRF attack.');
   // }
-
-  console.log(q);
-  console.log(q.code);
 
   try {
     const { tokens } = await oauth2Client.getToken(q.code);
@@ -217,7 +196,7 @@ app.get('/oauth2callback', async (req, res) => {
 
   } catch (authErr) {
     console.error("Login failed", authErr);
-    res.redirect('/');
+    res.redirect('/login fail');
   }
 });
 
