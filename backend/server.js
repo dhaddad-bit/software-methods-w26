@@ -120,6 +120,7 @@ app.get('/health', (req, res) => {
 app.get('/auth/google', async (req, res) => {
 // Generate a secure random state value.
   const username = req.query.username;
+  console.log('in first callback, username is ' + username);
   const state = crypto.randomBytes(32).toString('hex');
   // Store state in the session
   req.session.state = state;
@@ -161,6 +162,7 @@ app.get('/oauth2callback', async (req, res) => {
     const oauth2 = google.oauth2({version: 'v2', auth: oauth2Client});
     const {data: userInfo} = await oauth2.userinfo.get();
 
+    console.log('in the callback, username is ' + req.session.pending_username);
     const userId = db.insertUpdateUser(
       userInfo.id,
       userInfo.email, 
