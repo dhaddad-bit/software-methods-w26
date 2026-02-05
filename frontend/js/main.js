@@ -7,7 +7,7 @@ console.log("Frontend loaded");
 async function initApp() {
   const user = await getCurrentUser();
 
-  if (!user.loggedIn) {
+  if (!user) {
     window.location.href = "/login.html";
   }
 

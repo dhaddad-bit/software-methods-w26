@@ -80,11 +80,20 @@ const getUsersWithName = async(name) => {
     return result;
 }
 
+const getNameByID = async(id) => {
+    const query =  `
+    SELECT email, first_name, username FROM person
+    WHERE user_id = $1`
+    const result = await pool.query(query, [id]);
+    return result;
+}
+
 module.exports = {
     pool,
     testConnection,
     createUser,
     getUsersWithName,
     getUserByID,
+    getNameByID,
     insertUpdateUser
 }
