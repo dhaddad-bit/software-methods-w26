@@ -140,9 +140,9 @@ app.get('/oauth2callback', async (req, res) => {
     return res.redirect(frontend + '/error.html');
   }
 
-  if (q.state !== req.session.state) {
-    return res.status(403).send('State mismatch. Possible CSRF attack.');
-  }
+  // if (q.state !== req.session.state) {
+  //   return res.status(403).send('State mismatch. Possible CSRF attack.');
+  // }
 
   console.log(q);
   console.log(q.code);
