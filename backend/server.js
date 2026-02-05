@@ -76,23 +76,6 @@ app.get('/login', (req, res) => {
   res.sendFile(path.join(__dirname, "..", "frontend", "login.html"));
 });
 
-
-
-// app.get('/login', (req, res) => {
-//   // If already logged in, send them to the app
-//   if (req.session.tokens) {
-//     return res.redirect('/');
-//   }
-//   res.sendFile(path.join(__dirname, "..", "frontend", "login.html"));
-// });
-
-// check if user is logged in or not
-// app.get('api/me', (req, res) => {
-//   if (!req.session.tokens) return res.json({ loggedIn: false }); // stay on login page
-//   return res.json( { loggedIn: true }); // go to calendar view
-// });
-
-
 app.get('/logout', (req, res) => {
   req.session.destroy((err) => {
     if (err) {
@@ -101,7 +84,6 @@ app.get('/logout', (req, res) => {
     res.redirect('/login');
   });
 });
-
 
 // Database test route
 app.get('/api/test-db', async (req, res) => {

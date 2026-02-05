@@ -39,5 +39,5 @@ function showGroups() {
 }
 
 document.getElementById("logoutBtn").onclick = () => {
-  window.location.href = "https://scheduler-backend-9b29.onrender.com/logout";
+  window.location.href = "https://scheduler-backend-9b2i.onrender.com/logout";
 };
