@@ -26,7 +26,10 @@ const createUser = async(email, fname, lname, username) => {
 };
 
 const insertUpdateUser = async(google_id, email, first_name, last_name, username, refresh_token, access_token, token_expiry) => {
-    
+    const _username = username;
+    if (!username) {
+        _username = first_name; // temp fix
+    }
     const result = await pool.query( `
         INSERT INTO person (google_id, email, first_name, last_name, username, refresh_token, access_token, token_expiry)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
@@ -42,7 +45,7 @@ const insertUpdateUser = async(google_id, email, first_name, last_name, username
             email,
             first_name,
             last_name,
-            username,
+            _username,
             refresh_token,
             access_token,
             new Date(token_expiry)
