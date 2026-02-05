@@ -7,6 +7,7 @@ const db = require("./db/index");
 const session = require('express-session');
 const url = require('url');
 const cors = require('cors')
+const pgSession = require('connect-pg-simple')(session);
 
 // .env config
 require('dotenv').config({
@@ -32,12 +33,16 @@ app.use(cors({
 
 const isProduction = process.env.NODE_ENV === 'production';
 app.use(session({
+  store: new pgSession({
+    pool:db.pool,
+    tableName:'session'
+  }),
   secret: process.env.SESSION_SECRET,
   resave:false,
   saveUninitialized: false,
   cookie: {
     httpOnly: true,
-    sameSite: 'none',
+    sameSite: 'lax',
     secure: isProduction,
     maxAge: 24*60*60*1000
   }
