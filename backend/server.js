@@ -87,10 +87,10 @@ app.get('/login', (req, res) => {
 // });
 
 // check if user is logged in or not
-app.get('api/me', (req, res) => {
-  if (!req.session.tokens) return res.json({ loggedIn: false }); // stay on login page
-  return res.json( { loggedIn: true }); // go to calendar view
-});
+// app.get('api/me', (req, res) => {
+//   if (!req.session.tokens) return res.json({ loggedIn: false }); // stay on login page
+//   return res.json( { loggedIn: true }); // go to calendar view
+// });
 
 
 app.get('/logout', (req, res) => {
@@ -163,6 +163,8 @@ app.get('/oauth2callback', async (req, res) => {
     const {data: userInfo} = await oauth2.userinfo.get();
 
     console.log('in the callback, username is ' + req.session.pending_username);
+
+    // need to include groups ids
     const userId = await db.insertUpdateUser(
       userInfo.id,
       userInfo.email, 
