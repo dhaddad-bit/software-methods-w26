@@ -77,7 +77,6 @@ app.get('/login', (req, res) => {
 });
 
 
-
 // app.get('/login', (req, res) => {
 //   // If already logged in, send them to the app
 //   if (req.session.tokens) {
@@ -87,10 +86,21 @@ app.get('/login', (req, res) => {
 // });
 
 // check if user is logged in or not
-app.get('api/me', (req, res) => {
-  if (!req.session.tokens) return res.json({ loggedIn: false }); // stay on login page
-  return res.json( { loggedIn: true }); // go to calendar view
-});
+
+app.get('/api/me', async (req, res) => {
+  if (req.session.userId) {
+    const person_info = await db.getUserByID(req.session.userId);
+    res.json(person_info);
+  }
+  else {
+    res.json("");
+  }
+}) 
+
+// app.get('api/me', (req, res) => {
+//   if (!req.session.tokens) return res.json({ loggedIn: false }); // stay on login page
+//   return res.json( { loggedIn: true }); // go to calendar view
+// });
 
 
 app.get('/logout', (req, res) => {
@@ -163,6 +173,8 @@ app.get('/oauth2callback', async (req, res) => {
     const {data: userInfo} = await oauth2.userinfo.get();
 
     console.log('in the callback, username is ' + req.session.pending_username);
+
+    // need to include groups ids
     const userId = await db.insertUpdateUser(
       userInfo.id,
       userInfo.email, 
@@ -281,16 +293,6 @@ app.get("/api/events", async (req, res) => {
     res.status(500).json({ error: "Failed to fetch events" });
   }
 });
-
-app.get('/api/me', async (req, res) => {
-  if (req.session.userId) {
-    const person_info = await db.getUserByID(req.session.userId);
-    res.json(person_info);
-  }
-  else {
-    res.json("");
-  }
-}) 
 
 app.listen(PORT, async () => {
   console.log(`Server running on port ${PORT}`);
