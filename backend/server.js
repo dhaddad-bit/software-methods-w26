@@ -12,6 +12,8 @@ const pgSession = require('connect-pg-simple')(session);
 require('dotenv').config({
   path: process.env.NODE_ENV === 'production' ? '.env.production' : '.env.development'
 });
+console.log("Database URL Check:", process.env.DATABASE_URL ? "Found it!" : "It is UNDEFINED");
+
 console.log("ENV:", process.env.NODE_ENV);
 console.log("Frontend URL:", process.env.FRONTEND_URL);
 
@@ -22,6 +24,7 @@ const isProduction = process.env.NODE_ENV === 'production';
 
 app.use(express.json());
 app.set('trust proxy', 1);
+
 
 app.use(session({
   store: new pgSession({
@@ -44,6 +47,7 @@ app.use(session({
 // if (process.env.NODE_ENV !== "production") {
 //   app.use(express.static(path.join(__dirname, "..", "frontend"), { index: false }));
 // }
+
 app.use(express.static(path.join(__dirname, "..", "frontend"), { index: false }));
 
 const oauth2Client = new google.auth.OAuth2(
@@ -95,11 +99,6 @@ app.get('/api/me', async (req, res) => {
     res.json("");
   }
 }) 
-
-// app.get('api/me', (req, res) => {
-//   if (!req.session.tokens) return res.json({ loggedIn: false }); // stay on login page
-//   return res.json( { loggedIn: true }); // go to calendar view
-// });
 
 app.get('/logout', (req, res) => {
   req.session.destroy((err) => {
