@@ -6,9 +6,9 @@ require('dotenv').config({
 const isProduction = process.env.NODE_ENV === 'production';
 
 const pool = new Pool(
-    isProduction 
+  isProduction
     ? { connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } }
-    : { // else for local dev
+    : {
         user: process.env.DB_USER,
         host: process.env.DB_HOST,
         database: process.env.DB_NAME,
@@ -19,94 +19,192 @@ const pool = new Pool(
 );
 
 const testConnection = async () => {
-    const result = await pool.query('SELECT NOW()');
-    return {
-        success: true,
-        timestamp: result.rows[0].now,
-        message: "Database connected successfully!"
-    };
+  const result = await pool.query('SELECT NOW()');
+  return {
+    success: true,
+    timestamp: result.rows[0].now,
+    message: 'Database connected successfully!'
+  };
 };
 
-const createUser = async(email, fname, lname, username) => {
-    const query = `
-        INSERT INTO person (email, first_name, last_name, username)
-        VALUES ($1, $2, $3, $4)
-        RETURNING *
-    `
-    const result = await pool.query(query, [email, fname, lname, username]);
-    return result.rows[0];
-};
+const upsertUserFromGoogle = async (googleSub, email, name, refreshToken) => {
+  if (!googleSub && !email) {
+    throw new Error('googleSub or email is required');
+  }
 
-const insertUpdateUser = async(google_id, email, first_name, last_name, username, refresh_token, access_token, token_expiry) => {
-    var _username = username;
-    if (!username) {
-        _username = first_name; // temp fix
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    let user = null;
+
+    if (googleSub) {
+      const existingBySub = await client.query(
+        'SELECT id FROM users WHERE google_sub = $1',
+        [googleSub]
+      );
+      if (existingBySub.rows[0]) {
+        const updated = await client.query(
+          `UPDATE users
+           SET email = $2,
+               name = $3,
+               google_refresh_token = COALESCE($4, google_refresh_token),
+               updated_at = NOW()
+           WHERE google_sub = $1
+           RETURNING id, email, name`,
+          [googleSub, email, name, refreshToken || null]
+        );
+        user = updated.rows[0];
+      }
     }
-    const result = await pool.query( `
-        INSERT INTO person (google_id, email, first_name, last_name, username, refresh_token, access_token, token_expiry)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-        ON CONFLICT (google_id)
-        DO UPDATE SET 
-            refresh_token = $6,
-            access_token = $7,
-            token_expiry = $8,
-            updated_at = NOW()
-        RETURNING user_id`,
-        [   
-            google_id,
-            email,
-            first_name,
-            last_name,
-            _username,
-            refresh_token,
-            access_token,
-            new Date(token_expiry)
-        ]
-    );
-    // double check - might just be .id?
-    console.log('insert result:', result.rows[0]);
-    return result.rows[0].user_id;
-}
 
-const getUserByID = async(user_id) => {
-    const result = await pool.query(
-        `SELECT google_id, refresh_token, access_token, token_expiry FROM person WHERE user_id = $1`, [user_id]
-    );
-    return result.rows[0];
-}
+    if (!user && email) {
+      const existingByEmail = await client.query(
+        'SELECT id FROM users WHERE email = $1',
+        [email]
+      );
+      if (existingByEmail.rows[0]) {
+        const updated = await client.query(
+          `UPDATE users
+           SET google_sub = COALESCE($2, google_sub),
+               name = $3,
+               google_refresh_token = COALESCE($4, google_refresh_token),
+               updated_at = NOW()
+           WHERE email = $1
+           RETURNING id, email, name`,
+          [email, googleSub || null, name, refreshToken || null]
+        );
+        user = updated.rows[0];
+      }
+    }
 
-// TODO: get userwithID
-// get groups from user
-// get users from group
-// check if user already in db
-// get stored events from a user
+    if (!user) {
+      const inserted = await client.query(
+        `INSERT INTO users (google_sub, email, name, google_refresh_token)
+         VALUES ($1, $2, $3, $4)
+         RETURNING id, email, name`,
+        [googleSub || null, email, name, refreshToken || null]
+      );
+      user = inserted.rows[0];
+    }
 
-const getUsersWithName = async(name) => {
-    console.log('running q');
-    const query = `
-        SELECT email, last_name, username FROM person
-        WHERE first_name = $1 
-    `
-    const result = await pool.query(query, [name]);
-    console.log(result);
-    return result;
-}
+    await client.query('COMMIT');
+    return user;
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+};
 
-const getNameByID = async(id) => {
-    const query =  `
-    SELECT email, first_name, username FROM person
-    WHERE user_id = $1`
-    const result = await pool.query(query, [id]);
-    return result;
-}
+const getUserById = async (userId) => {
+  const result = await pool.query(
+    `SELECT id, email, name, google_refresh_token
+     FROM users
+     WHERE id = $1`,
+    [userId]
+  );
+  return result.rows[0];
+};
+
+const getUserByEmail = async (email) => {
+  const result = await pool.query(
+    `SELECT id, email, name, google_refresh_token
+     FROM users
+     WHERE email = $1`,
+    [email]
+  );
+  return result.rows[0];
+};
+
+const createGroup = async (name, createdByUserId) => {
+  const result = await pool.query(
+    `INSERT INTO groups (name, created_by_user_id)
+     VALUES ($1, $2)
+     RETURNING id, name, created_by_user_id, created_at, updated_at`,
+    [name, createdByUserId]
+  );
+  return result.rows[0];
+};
+
+const listGroupsForUser = async (userId) => {
+  const result = await pool.query(
+    `SELECT g.id, g.name, g.created_by_user_id, g.created_at, g.updated_at
+     FROM groups g
+     INNER JOIN group_memberships gm ON gm.group_id = g.id
+     WHERE gm.user_id = $1
+     ORDER BY g.id`,
+    [userId]
+  );
+  return result.rows;
+};
+
+const getGroupById = async (groupId) => {
+  const result = await pool.query(
+    `SELECT id, name, created_by_user_id, created_at, updated_at
+     FROM groups
+     WHERE id = $1`,
+    [groupId]
+  );
+  return result.rows[0];
+};
+
+const isUserInGroup = async (groupId, userId) => {
+  const result = await pool.query(
+    `SELECT 1 FROM group_memberships WHERE group_id = $1 AND user_id = $2`,
+    [groupId, userId]
+  );
+  return result.rowCount > 0;
+};
+
+const addGroupMember = async (groupId, userId, role = null) => {
+  const result = await pool.query(
+    `INSERT INTO group_memberships (group_id, user_id, role)
+     VALUES ($1, $2, $3)
+     ON CONFLICT (group_id, user_id) DO NOTHING
+     RETURNING group_id, user_id, role`,
+    [groupId, userId, role]
+  );
+  return result.rows[0];
+};
+
+const getGroupMembers = async (groupId) => {
+  const result = await pool.query(
+    `SELECT u.id, u.email, u.name
+     FROM users u
+     INNER JOIN group_memberships gm ON gm.user_id = u.id
+     WHERE gm.group_id = $1
+     ORDER BY u.id`,
+    [groupId]
+  );
+  return result.rows;
+};
+
+const getGroupMembersWithTokens = async (groupId) => {
+  const result = await pool.query(
+    `SELECT u.id, u.email, u.name, u.google_refresh_token
+     FROM users u
+     INNER JOIN group_memberships gm ON gm.user_id = u.id
+     WHERE gm.group_id = $1
+     ORDER BY u.id`,
+    [groupId]
+  );
+  return result.rows;
+};
 
 module.exports = {
-    pool,
-    query: (text, params) => pool.query(text,params),
-    testConnection,
-    createUser,
-    getUsersWithName,
-    getUserByID,
-    getNameByID,
-    insertUpdateUser
-}
+  pool,
+  query: (text, params) => pool.query(text, params),
+  testConnection,
+  upsertUserFromGoogle,
+  getUserById,
+  getUserByEmail,
+  createGroup,
+  listGroupsForUser,
+  getGroupById,
+  isUserInGroup,
+  addGroupMember,
+  getGroupMembers,
+  getGroupMembersWithTokens
+};

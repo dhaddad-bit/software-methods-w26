@@ -2,20 +2,22 @@
 const express = require('express');
 const { google } = require('googleapis');
 const crypto = require('crypto');
-const path = require("path");
-const db = require("./db/index");
+const path = require('path');
+const db = require('./db/index');
 const session = require('express-session');
 const url = require('url');
 const pgSession = require('connect-pg-simple')(session);
+const { computeAvailabilityBlocks } = require('./algorithm/index.cjs');
+const { fetchBusyIntervalsForUser, listGoogleEvents } = require('./services/googleCalendar');
 
 // .env config
 require('dotenv').config({
   path: process.env.NODE_ENV === 'production' ? '.env.production' : '.env.development'
 });
-console.log("Database URL Check:", process.env.DATABASE_URL ? "Found it!" : "It is UNDEFINED");
+console.log('Database URL Check:', process.env.DATABASE_URL ? 'Found it!' : 'It is UNDEFINED');
 
-console.log("ENV:", process.env.NODE_ENV);
-console.log("Frontend URL:", process.env.FRONTEND_URL);
+console.log('ENV:', process.env.NODE_ENV);
+console.log('Frontend URL:', process.env.FRONTEND_URL);
 
 const frontend = process.env.FRONTEND_URL;
 const app = express();
@@ -25,35 +27,37 @@ const isProduction = process.env.NODE_ENV === 'production';
 app.use(express.json());
 app.set('trust proxy', 1);
 
+app.use(
+  session({
+    store: new pgSession({
+      pool: db.pool,
+      tableName: 'session',
+      createTableIfMissing: true
+    }),
+    secret: process.env.SESSION_SECRET,
+    resave: false,
+    saveUninitialized: false,
+    cookie: {
+      httpOnly: true,
+      sameSite: 'lax',
+      secure: isProduction,
+      maxAge: 24 * 60 * 60 * 1000,
+      path: '/'
+    }
+  })
+);
 
-app.use(session({
-  store: new pgSession({
-    pool:db.pool,
-    tableName:'session'
-  }),
-  secret: process.env.SESSION_SECRET,
-  resave:false,
-  saveUninitialized: false,
-  cookie: {
-    httpOnly: true,
-    sameSite: 'lax',
-    secure: isProduction,
-    maxAge: 24*60*60*1000,
-    path: '/'
-  }
-}));
+app.use(express.static(path.join(__dirname, '..', 'frontend'), { index: false }));
 
-// Serve frontend in development mode
-// if (process.env.NODE_ENV !== "production") {
-//   app.use(express.static(path.join(__dirname, "..", "frontend"), { index: false }));
-// }
-
-app.use(express.static(path.join(__dirname, "..", "frontend"), { index: false }));
+const defaultRedirectUri = isProduction
+  ? `https://${process.env.RENDER_EXTERNAL_HOSTNAME || 'YOUR-APP-NAME.onrender.com'}/oauth2callback`
+  : 'http://localhost:3000/oauth2callback';
+const redirectUri = process.env.GOOGLE_REDIRECT_URI || defaultRedirectUri;
 
 const oauth2Client = new google.auth.OAuth2(
   process.env.GOOGLE_CLIENT_ID,
   process.env.GOOGLE_CLIENT_SECRET,
-  process.env.GOOGLE_REDIRECT_URI
+  redirectUri
 );
 
 const scopes = [
@@ -64,41 +68,69 @@ const scopes = [
 
 const PORT = process.env.PORT || 3000;
 
+function requireAuth(req, res, next) {
+  if (!req.session.userId) {
+    return res.status(401).json({ error: 'User not authenticated' });
+  }
+  return next();
+}
+
+async function requireGroupMember(req, res, next) {
+  const groupId = Number.parseInt(req.params.groupId, 10);
+  if (!Number.isInteger(groupId)) {
+    return res.status(400).json({ error: 'Invalid groupId' });
+  }
+
+  const group = await db.getGroupById(groupId);
+  if (!group) {
+    return res.status(404).json({ error: 'Group not found' });
+  }
+
+  const isMember = await db.isUserInGroup(groupId, req.session.userId);
+  if (!isMember) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+
+  req.group = group;
+  req.groupId = groupId;
+  return next();
+}
+
+function parseTimeParam(value) {
+  if (value === undefined || value === null || value === '') return null;
+  const numeric = Number(value);
+  if (!Number.isNaN(numeric) && String(value).match(/^\d+$/)) {
+    return numeric;
+  }
+  const parsed = Date.parse(value);
+  if (Number.isNaN(parsed)) return null;
+  return parsed;
+}
 
 // ===================PAGES========================
 
-
 app.get('/', (req, res) => {
-  if (typeof req.session.userId !== "undefined") {
-    res.sendFile(path.join(__dirname, "..", "frontend", "index.html"));
+  if (typeof req.session.userId !== 'undefined') {
+    res.sendFile(path.join(__dirname, '..', 'frontend', 'index.html'));
   } else {
     res.redirect('/login');
   }
 });
 
 app.get('/login', (req, res) => {
-  res.sendFile(path.join(__dirname, "..", "frontend", "login.html"));
+  res.sendFile(path.join(__dirname, '..', 'frontend', 'login.html'));
 });
 
-// app.get('/login', (req, res) => {
-//   // If already logged in, send them to the app
-//   if (req.session.tokens) {
-//     return res.redirect('/');
-//   }
-//   res.sendFile(path.join(__dirname, "..", "frontend", "login.html"));
-// });
-
-// check if user is logged in or not
-
 app.get('/api/me', async (req, res) => {
-  if (req.session.userId) {
-    const person_info = await db.getUserByID(req.session.userId);
-    res.json(person_info);
+  if (!req.session.userId) {
+    return res.status(401).json({ error: 'User not authenticated' });
   }
-  else {
-    res.json("");
+  const user = await db.getUserById(req.session.userId);
+  if (!user) {
+    return res.status(401).json({ error: 'User not authenticated' });
   }
-}) 
+  return res.json({ id: user.id, email: user.email, name: user.name });
+});
 
 app.get('/logout', (req, res) => {
   req.session.destroy((err) => {
@@ -112,12 +144,12 @@ app.get('/logout', (req, res) => {
 // Database test route
 app.get('/api/test-db', async (req, res) => {
   try {
-    const result = await testConnection();
+    const result = await db.testConnection();
     res.json(result);
   } catch (error) {
-    res.status(500).json({ 
-      success: false, 
-      error: error.message 
+    res.status(500).json({
+      success: false,
+      error: error.message
     });
   }
 });
@@ -128,22 +160,17 @@ app.get('/health', (req, res) => {
 });
 
 app.get('/auth/google', async (req, res) => {
-// Generate a secure random state value.
   const username = req.query.username;
-  console.log('in first callback, username is ' + username);
   const state = crypto.randomBytes(32).toString('hex');
-  // Store state in the session
   req.session.state = state;
   req.session.pending_username = username;
 
   const authorizationUrl = oauth2Client.generateAuthUrl({
     access_type: 'offline',
     scope: scopes,
-    // Enable incremental authorization. Recommended as a best practice.
     include_granted_scopes: true,
-    // Include the state parameter to reduce the risk of CSRF attacks.
     state: state,
-    prompt:"consent"
+    prompt: 'consent'
   });
   res.redirect(authorizationUrl);
 });
@@ -151,38 +178,29 @@ app.get('/auth/google', async (req, res) => {
 app.get('/oauth2callback', async (req, res) => {
   const q = url.parse(req.url, true).query;
 
-  // Security checks
   if (q.error) {
     console.log(q);
     return res.redirect(frontend + '/error.html');
   }
 
-  // if (q.state !== req.session.state) {
-  //   return res.status(403).send('State mismatch. Possible CSRF attack.');
-  // }
-
   try {
     const { tokens } = await oauth2Client.getToken(q.code);
     oauth2Client.setCredentials(tokens);
 
-    const oauth2 = google.oauth2({version: 'v2', auth: oauth2Client});
-    const {data: userInfo} = await oauth2.userinfo.get();
+    const oauth2 = google.oauth2({ version: 'v2', auth: oauth2Client });
+    const { data: userInfo } = await oauth2.userinfo.get();
 
-    console.log('in the callback, username is ' + req.session.pending_username);
+    const displayName = userInfo.name || `${userInfo.given_name || ''} ${userInfo.family_name || ''}`.trim();
+    const refreshToken = tokens.refresh_token || null;
 
-    // need to include groups ids
-    const userId = await db.insertUpdateUser(
+    const user = await db.upsertUserFromGoogle(
       userInfo.id,
-      userInfo.email, 
-      userInfo.given_name, 
-      userInfo.family_name, 
-      req.session.pending_username,
-      tokens.refresh_token, 
-      tokens.access_token, 
-      tokens.expiry_date
+      userInfo.email,
+      displayName,
+      refreshToken
     );
 
-    req.session.userId = userId;
+    req.session.userId = user.id;
     req.session.isAuthenticated = true;
 
     delete req.session.state;
@@ -191,7 +209,7 @@ app.get('/oauth2callback', async (req, res) => {
     await new Promise((resolve, reject) => {
       req.session.save((saveErr) => {
         if (saveErr) {
-          console.error("Session Save Error:", saveErr);
+          console.error('Session Save Error:', saveErr);
           reject(saveErr);
         } else {
           resolve();
@@ -199,16 +217,165 @@ app.get('/oauth2callback', async (req, res) => {
       });
     });
 
-    // Add a small delay to ensure DB write completes
-    await new Promise(resolve => setTimeout(resolve, 100));
-    console.log('session saved, redirecting.');
-    res.redirect("/");
-
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    res.redirect('/');
   } catch (authErr) {
-    console.error("Login failed", authErr);
+    console.error('Login failed', authErr);
     res.redirect('/login fail');
   }
 });
+
+// ===================GROUPS========================
+
+app.post('/api/groups', requireAuth, async (req, res) => {
+  const name = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
+  if (!name) {
+    return res.status(400).json({ error: 'Group name is required' });
+  }
+
+  const group = await db.createGroup(name, req.session.userId);
+  await db.addGroupMember(group.id, req.session.userId, 'owner');
+
+  return res.status(201).json(group);
+});
+
+app.get('/api/groups', requireAuth, async (req, res) => {
+  const groups = await db.listGroupsForUser(req.session.userId);
+  return res.json(groups);
+});
+
+app.get('/api/groups/:groupId/members', requireAuth, requireGroupMember, async (req, res) => {
+  const members = await db.getGroupMembers(req.groupId);
+  return res.json(members);
+});
+
+app.post('/api/groups/:groupId/members', requireAuth, requireGroupMember, async (req, res) => {
+  const email = typeof req.body?.email === 'string' ? req.body.email.trim() : '';
+  if (!email) {
+    return res.status(400).json({ error: 'Email is required' });
+  }
+
+  const user = await db.getUserByEmail(email);
+  if (!user) {
+    // MVP: no invites; user must have logged in before
+    return res.status(404).json({ error: 'User not found. User must log in first.' });
+  }
+
+  await db.addGroupMember(req.groupId, user.id, null);
+  return res.status(200).json({ id: user.id, email: user.email, name: user.name });
+});
+
+// ===================AVAILABILITY========================
+
+app.get('/api/groups/:groupId/availability', requireAuth, requireGroupMember, async (req, res) => {
+  const windowStartMs = parseTimeParam(req.query.start);
+  const windowEndMs = parseTimeParam(req.query.end);
+  const granularityRaw = req.query.granularity;
+
+  if (!Number.isFinite(windowStartMs) || !Number.isFinite(windowEndMs)) {
+    return res.status(400).json({ error: 'start and end are required (ISO or epoch ms)' });
+  }
+  if (windowEndMs <= windowStartMs) {
+    return res.status(400).json({ error: 'end must be greater than start' });
+  }
+
+  let granularityMinutes;
+  if (granularityRaw !== undefined) {
+    granularityMinutes = Number.parseInt(granularityRaw, 10);
+    if (!Number.isInteger(granularityMinutes) || granularityMinutes <= 0) {
+      return res.status(400).json({ error: 'granularity must be a positive integer (minutes)' });
+    }
+  }
+
+  try {
+    const members = await db.getGroupMembersWithTokens(req.groupId);
+
+    const participants = await Promise.all(
+      members.map(async (member) => {
+        const intervals = await fetchBusyIntervalsForUser({
+          userId: String(member.id),
+          refreshToken: member.google_refresh_token,
+          windowStartMs,
+          windowEndMs
+        });
+        return { userId: String(member.id), events: intervals };
+      })
+    );
+
+    const args = {
+      windowStartMs,
+      windowEndMs,
+      participants
+    };
+
+    if (granularityMinutes) {
+      args.granularityMinutes = granularityMinutes;
+    }
+
+    const blocks = computeAvailabilityBlocks(args);
+    return res.json(blocks);
+  } catch (error) {
+    if (error.code === 'NO_REFRESH_TOKEN') {
+      return res.status(400).json({ error: 'One or more members need to re-authenticate.' });
+    }
+    console.error('Error computing availability', error);
+    return res.status(500).json({ error: 'Failed to compute availability' });
+  }
+});
+
+// ===================CALENDAR EVENTS========================
+
+app.get('/api/events', requireAuth, async (req, res) => {
+  try {
+    const user = await db.getUserById(req.session.userId);
+    if (!user || !user.google_refresh_token) {
+      return res.status(401).json({ error: 'No tokens found. Please re-authenticate.' });
+    }
+
+    const calendarStart = new Date();
+    calendarStart.setDate(calendarStart.getDate() - 14);
+
+    const events = await listGoogleEvents({
+      refreshToken: user.google_refresh_token,
+      timeMin: calendarStart
+    });
+
+    if (!events || events.length === 0) {
+      return res.json([]);
+    }
+
+    const formattedEvents = events.map((event) => {
+      const start = event.start.dateTime || event.start.date;
+      const end = event.end.dateTime || event.end.date;
+
+      return {
+        title: event.summary || 'No Title',
+        start: start,
+        end: end
+      };
+    });
+
+    res.json(formattedEvents);
+  } catch (error) {
+    console.error('Error fetching calendar', error);
+
+    if (error.code === 401 || error.code === 403) {
+      req.session.destroy(() => {});
+      return res.status(401).json({ error: 'Authentication expired. Please log in again.' });
+    }
+
+    res.status(500).json({ error: 'Failed to fetch events' });
+  }
+});
+
+if (process.env.NODE_ENV === 'test') {
+  app.post('/test/login', (req, res) => {
+    const userId = req.body?.userId;
+    req.session.userId = userId;
+    req.session.isAuthenticated = true;
+    res.json({ ok: true });
+  });
+}
 
 app.get('/test-session', (req, res) => {
   res.json({
@@ -219,78 +386,10 @@ app.get('/test-session', (req, res) => {
   });
 });
 
-app.get("/api/events", async (req, res) => {
-  console.log('Session ID:', req.sessionID);
-  console.log('Session data:', req.session);
-  console.log('userid:', req.session.userId);
-  console.log('isAuthenticated:', req.session.isAuthenticated);
-  // Check if user is logged in
-  if (!req.session.userId || !req.session.isAuthenticated) {
-    return res.status(401).json({ error: "User not authenticated" });
-  }
-  try {
-    // Set credentials for this specific request using session data
-    const user = await db.getUserByID(req.session.userId);
-    console.log('user in /api/events: ', user);
-    if (!user || !user.refresh_token) {
-      return res.status(401).json({ error: "No tokens found. Please re-authenticate." });
-    }
-    const refreshToken = user.refresh_token; // TODO: encrypt this
+if (require.main === module) {
+  app.listen(PORT, async () => {
+    console.log(`Server running on port ${PORT}`);
+  });
+}
 
-    oauth2Client.setCredentials( {
-      refresh_token: refreshToken,
-      access_token: user.access_token,
-      expiry_date: user.token_expiry ? new Date(user.token_expiry).getTime() : null
-    });
-
-    // add some updating tokens logic here
-
-    const calendar = google.calendar({ version: 'v3', auth: oauth2Client });
-    const calendarStart = new Date();
-
-    calendarStart.setDate(calendarStart.getDate() - 14);
-
-    const response = await calendar.events.list({
-      calendarId: 'primary',
-      timeMin: calendarStart.toISOString(), // From now onwards
-      maxResults: 50,
-      singleEvents: true, 
-      orderBy: 'startTime',
-    });
-
-    const events = response.data.items;
-    
-    if (!events || events.length === 0) {
-      return res.json([]);
-    }
-
-    const formattedEvents = events.map((event) => {
-      const start = event.start.dateTime || event.start.date;
-      const end = event.end.dateTime || event.end.date;
-
-      return {
-        title: event.summary || "No Title",
-        start: start,
-        end: end
-      };
-    });
-  
-    res.json(formattedEvents);
-
-  } catch (error) {
-    console.error('Error fetching calendar', error);
-    
-    // If authentication failed, clear session
-    if (error.code === 401 || error.code === 403) {
-      req.session.destroy();
-      return res.status(401).json({ error: "Authentication expired. Please log in again." });
-    }
-    
-    res.status(500).json({ error: "Failed to fetch events" });
-  }
-});
-
-app.listen(PORT, async () => {
-  console.log(`Server running on port ${PORT}`);
-  
-});
+module.exports = { app };
