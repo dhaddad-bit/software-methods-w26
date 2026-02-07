@@ -1,1 +1,0 @@
--- Intentionally blank for MVP. No calendar or event metadata tables.
