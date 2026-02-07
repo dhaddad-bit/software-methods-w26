@@ -20,10 +20,6 @@ initApp();
 document.getElementById("calendarBtn").onclick = showCalendar;
 document.getElementById("groupsBtn").onclick = showGroups;
 
-document.getElementById("create-group-btn").onclick = () => {
-  console.log("create group button click");
-}
-
 function showCalendar() {
   console.log("Switching to calendar view");
   document.getElementById("calendar").hidden = false;

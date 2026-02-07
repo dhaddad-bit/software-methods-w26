@@ -40,6 +40,7 @@ export async function renderCalendarGrid(container, weekStart, events) {
       const cell = document.createElement("div");
       cell.className = "calendar-cell";
       cell.dataset.day = day.toDateString();
+      cell.dataset.dayMs = day.getTime();
       cell.dataset.hour = hour;
 
       events.forEach(event => {

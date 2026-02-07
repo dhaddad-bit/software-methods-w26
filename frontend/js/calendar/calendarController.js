@@ -54,5 +54,5 @@ export async function renderCalendar() {
   }
 
   console.log("Before renderAvailability", container.innerHTML);
-  renderAvailability();
+  renderAvailability({ root: container });
 }

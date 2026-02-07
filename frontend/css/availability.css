@@ -1,5 +1,7 @@
 .availability-block {
   position: absolute;
-  inset: 0;
+  left: 0;
+  right: 0;
   background-color: rgba(76, 175, 80, 0.35);
+  pointer-events: none;
 }

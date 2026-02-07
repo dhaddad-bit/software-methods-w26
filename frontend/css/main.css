@@ -53,3 +53,92 @@ button:hover {
   font-weight:bolder;
   font-size:70px;
 }
+
+#groups {
+  padding: 20px;
+}
+
+#groups h2 {
+  text-align: center;
+}
+
+.groups-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  justify-content: center;
+  margin-bottom: 10px;
+}
+
+.group-input {
+  padding: 8px 12px;
+  font-size: 16px;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+  font-family: 'Courier New', Courier, monospace;
+}
+
+.group-message {
+  text-align: center;
+  min-height: 24px;
+  margin-bottom: 10px;
+  font-size: 14px;
+  color: #2c3e50;
+}
+
+.group-message[data-type="error"] {
+  color: #c0392b;
+}
+
+.group-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-width: 640px;
+  margin: 0 auto;
+}
+
+.group-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 14px;
+  border: 1px solid #e0e0e0;
+  border-radius: 6px;
+  background: #fafafa;
+}
+
+.group-row button {
+  font-size: 16px;
+  padding: 6px 12px;
+}
+
+.group-detail {
+  margin-top: 20px;
+}
+
+.group-detail-header {
+  text-align: center;
+}
+
+.group-detail-subtitle {
+  margin-top: 4px;
+  color: #555;
+  font-size: 14px;
+}
+
+.group-status {
+  text-align: center;
+  margin: 8px 0;
+  font-size: 14px;
+  color: #555;
+  min-height: 20px;
+}
+
+.group-status[data-type="error"] {
+  color: #c0392b;
+}
+
+.group-calendar {
+  margin-top: 10px;
+}
