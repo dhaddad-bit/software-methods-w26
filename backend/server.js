@@ -312,7 +312,7 @@ app.get('/api/groups/:groupId/availability', requireAuth, requireGroupMember, as
       args.granularityMinutes = granularityMinutes;
     }
 
-    const blocks = computeAvailabilityBlocks(args);
+    const blocks = await computeAvailabilityBlocks(args);
     return res.json(blocks);
   } catch (error) {
     if (error.code === 'NO_REFRESH_TOKEN') {
