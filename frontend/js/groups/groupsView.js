@@ -1,9 +1,15 @@
-import { apiGet, apiPost } from "../api/api.js";
+import { apiGet, apiPost, apiDelete } from "../api/api.js";
 import { renderCalendarGrid } from "../calendar/calendarRender.js";
 import { renderAvailability } from "../calendar/availabilityRender.js";
+import { renderPetitions } from "../calendar/petitionRender.js";
+
+const GRANULARITY_MINUTES = 15;
+const BLOCK_MS = GRANULARITY_MINUTES * 60 * 1000;
 
 let currentWeekStart = getStartOfWeek(new Date());
 let selectedGroupId = null;
+let currentUserId = null;
+let windowPointerUpHandler = null;
 
 function getStartOfWeek(date) {
   const d = new Date(date);
@@ -30,6 +36,20 @@ function setMessage(el, message, isError = false) {
   if (!el) return;
   el.textContent = message || "";
   el.dataset.type = isError ? "error" : "info";
+}
+
+async function ensureCurrentUserId() {
+  if (currentUserId) return;
+  const me = await apiGet("/api/me");
+  if (me && me.id) {
+    currentUserId = me.id;
+  }
+}
+
+function formatRange(startMs, endMs) {
+  const start = new Date(startMs);
+  const end = new Date(endMs);
+  return `${start.toLocaleString()} → ${end.toLocaleTimeString()}`;
 }
 
 async function fetchGroups() {
@@ -62,7 +82,7 @@ async function fetchGroupAvailability(groupId, weekStart) {
   const query = new URLSearchParams({
     start: String(startMs),
     end: String(endMs),
-    granularity: "30"
+    granularity: String(GRANULARITY_MINUTES)
   });
 
   const blocks = await apiGet(`/api/groups/${groupId}/availability?${query.toString()}`);
@@ -73,6 +93,41 @@ async function fetchGroupAvailability(groupId, weekStart) {
     throw new Error("Unexpected availability response");
   }
   return blocks;
+}
+
+async function fetchGroupPetitions(groupId) {
+  const petitions = await apiGet(`/api/groups/${groupId}/petitions`);
+  if (petitions && petitions.error) {
+    throw new Error(petitions.error);
+  }
+  if (!Array.isArray(petitions)) {
+    throw new Error("Unexpected petitions response");
+  }
+  return petitions;
+}
+
+async function createPetition(groupId, payload) {
+  const response = await apiPost(`/api/groups/${groupId}/petitions`, payload);
+  if (response && response.error) {
+    throw new Error(response.error);
+  }
+  return response;
+}
+
+async function respondToPetition(petitionId, response) {
+  const result = await apiPost(`/api/petitions/${petitionId}/respond`, { response });
+  if (result && result.error) {
+    throw new Error(result.error);
+  }
+  return result;
+}
+
+async function deletePetition(petitionId) {
+  const result = await apiDelete(`/api/petitions/${petitionId}`);
+  if (result && result.error) {
+    throw new Error(result.error);
+  }
+  return result;
 }
 
 function renderGroupRow(group, onView) {
@@ -93,6 +148,8 @@ function renderGroupRow(group, onView) {
 }
 
 export async function renderGroups() {
+  await ensureCurrentUserId();
+
   const container = document.getElementById("groups");
   container.innerHTML = "";
 
@@ -142,7 +199,7 @@ export async function renderGroups() {
 
   const detailSubtitle = document.createElement("p");
   detailSubtitle.className = "group-detail-subtitle";
-  detailSubtitle.textContent = "Darker green = more members available.";
+  detailSubtitle.textContent = "Darker green = more members available. Select only darkest blocks.";
 
   detailHeader.appendChild(detailTitle);
   detailHeader.appendChild(detailSubtitle);
@@ -150,13 +207,56 @@ export async function renderGroups() {
   const detailStatus = document.createElement("div");
   detailStatus.className = "group-status";
 
+  const petitionMessage = document.createElement("div");
+  petitionMessage.className = "petition-message";
+
   const calendarWrapper = document.createElement("div");
   calendarWrapper.id = "group-calendar";
   calendarWrapper.className = "group-calendar";
 
+  const selectionPanel = document.createElement("div");
+  selectionPanel.className = "petition-panel";
+  selectionPanel.hidden = true;
+
+  const selectionInfo = document.createElement("div");
+  selectionInfo.className = "petition-panel-info";
+
+  const titleInput = document.createElement("input");
+  titleInput.type = "text";
+  titleInput.placeholder = "Petition title";
+  titleInput.className = "petition-input";
+
+  const prioritySelect = document.createElement("select");
+  prioritySelect.className = "petition-select";
+  const highestOption = document.createElement("option");
+  highestOption.value = "HIGHEST";
+  highestOption.textContent = "Highest";
+  prioritySelect.appendChild(highestOption);
+  prioritySelect.value = "HIGHEST";
+
+  const createPetitionBtn = document.createElement("button");
+  createPetitionBtn.type = "button";
+  createPetitionBtn.textContent = "Create/Finalize Petition/Event";
+
+  const cancelSelectionBtn = document.createElement("button");
+  cancelSelectionBtn.type = "button";
+  cancelSelectionBtn.textContent = "Cancel";
+
+  selectionPanel.appendChild(selectionInfo);
+  selectionPanel.appendChild(titleInput);
+  selectionPanel.appendChild(prioritySelect);
+  selectionPanel.appendChild(createPetitionBtn);
+  selectionPanel.appendChild(cancelSelectionBtn);
+
+  const petitionActions = document.createElement("div");
+  petitionActions.className = "petition-action-bar";
+
   detail.appendChild(detailHeader);
   detail.appendChild(detailStatus);
+  detail.appendChild(petitionMessage);
   detail.appendChild(calendarWrapper);
+  detail.appendChild(selectionPanel);
+  detail.appendChild(petitionActions);
 
   container.appendChild(title);
   container.appendChild(form);
@@ -168,8 +268,18 @@ export async function renderGroups() {
     selectedGroupId = group.id;
     detail.hidden = false;
     detailTitle.textContent = group.name;
+    petitionMessage.textContent = "";
 
     calendarWrapper.innerHTML = "";
+    petitionActions.innerHTML = "";
+    selectionPanel.hidden = true;
+
+    let selection = null;
+    let selectableSlots = new Map();
+    let isSelecting = false;
+    let anchorStartMs = null;
+    let anchorEndMs = null;
+    let petitionsCache = [];
 
     const header = document.createElement("div");
     header.className = "calendar-header";
@@ -199,15 +309,249 @@ export async function renderGroups() {
 
     renderCalendarGrid(gridContainer, currentWeekStart, []);
 
-    setMessage(detailStatus, "Loading availability...");
+    const updateSelectionHighlight = (rangeStartMs, rangeEndMs) => {
+      gridContainer.querySelectorAll(".availability-slot.selected").forEach((el) => {
+        el.classList.remove("selected");
+      });
 
-    try {
-      const blocks = await fetchGroupAvailability(group.id, currentWeekStart);
-      renderAvailability({ root: gridContainer, slots: blocks, minFraction: 0 });
-      setMessage(detailStatus, "");
-    } catch (error) {
-      setMessage(detailStatus, error.message || "Failed to load availability", true);
-    }
+      for (let t = rangeStartMs; t < rangeEndMs; t += BLOCK_MS) {
+        const el = selectableSlots.get(t);
+        if (el) {
+          el.classList.add("selected");
+        }
+      }
+    };
+
+    const clearSelection = () => {
+      selection = null;
+      updateSelectionHighlight(0, 0);
+      selectionPanel.hidden = true;
+    };
+
+    const updateSelectionPanel = () => {
+      if (!selection) {
+        selectionPanel.hidden = true;
+        return;
+      }
+      selectionInfo.textContent = `${formatRange(selection.startMs, selection.endMs)} (${(
+        (selection.endMs - selection.startMs) /
+        (60 * 1000)
+      ).toFixed(0)} mins)`;
+      selectionPanel.hidden = false;
+    };
+
+    const validateRange = (rangeStartMs, rangeEndMs) => {
+      for (let t = rangeStartMs; t < rangeEndMs; t += BLOCK_MS) {
+        if (!selectableSlots.has(t)) {
+          return false;
+        }
+      }
+      return true;
+    };
+
+    const handlePointerDown = (event) => {
+      const slot = event.target.closest(".availability-slot.selectable");
+      if (!slot) return;
+      event.preventDefault();
+
+      const startMs = Number(slot.dataset.startMs);
+      const endMs = Number(slot.dataset.endMs);
+      if (!Number.isFinite(startMs) || !Number.isFinite(endMs)) return;
+
+      isSelecting = true;
+      anchorStartMs = startMs;
+      anchorEndMs = endMs;
+      selection = { startMs, endMs };
+      updateSelectionHighlight(startMs, endMs);
+      updateSelectionPanel();
+    };
+
+    const handlePointerOver = (event) => {
+      if (!isSelecting) return;
+      const slot = event.target.closest(".availability-slot.selectable");
+      if (!slot) return;
+
+      const startMs = Number(slot.dataset.startMs);
+      const endMs = Number(slot.dataset.endMs);
+      if (!Number.isFinite(startMs) || !Number.isFinite(endMs)) return;
+
+      const rangeStartMs = Math.min(anchorStartMs, startMs);
+      const rangeEndMs = Math.max(anchorEndMs, endMs);
+
+      if (!validateRange(rangeStartMs, rangeEndMs)) {
+        setMessage(petitionMessage, "Selection must be contiguous fully-free blocks.", true);
+        return;
+      }
+
+      setMessage(petitionMessage, "");
+      selection = { startMs: rangeStartMs, endMs: rangeEndMs };
+      updateSelectionHighlight(rangeStartMs, rangeEndMs);
+      updateSelectionPanel();
+    };
+
+    const handlePointerUp = () => {
+      if (!isSelecting) return;
+      isSelecting = false;
+      updateSelectionPanel();
+    };
+
+    const setupSelectionHandlers = () => {
+      selectableSlots = new Map();
+      gridContainer.querySelectorAll(".availability-slot.selectable").forEach((el) => {
+        const startMs = Number(el.dataset.startMs);
+        if (Number.isFinite(startMs)) {
+          selectableSlots.set(startMs, el);
+        }
+      });
+
+      gridContainer.addEventListener("pointerdown", handlePointerDown);
+      gridContainer.addEventListener("pointerover", handlePointerOver);
+
+      if (windowPointerUpHandler) {
+        window.removeEventListener("pointerup", windowPointerUpHandler);
+      }
+      windowPointerUpHandler = handlePointerUp;
+      window.addEventListener("pointerup", windowPointerUpHandler);
+    };
+
+    const updatePetitionActions = (petition) => {
+      petitionActions.innerHTML = "";
+      if (!petition) return;
+
+      const info = document.createElement("div");
+      info.className = "petition-action-info";
+      const start = new Date(petition.startMs);
+      const end = new Date(petition.endMs);
+      info.textContent = `${petition.title} • ${petition.status} • ${start.toLocaleString()} → ${end.toLocaleTimeString()}`;
+
+      const actions = document.createElement("div");
+      actions.className = "petition-action-buttons";
+
+      if (petition.status !== "FAILED") {
+        const acceptBtn = document.createElement("button");
+        acceptBtn.textContent = "Accept";
+        acceptBtn.onclick = async () => {
+          try {
+            await respondToPetition(petition.id, "ACCEPT");
+            await refreshData();
+            setMessage(petitionMessage, "");
+          } catch (error) {
+            setMessage(petitionMessage, error.message || "Failed to respond", true);
+          }
+        };
+
+        const declineBtn = document.createElement("button");
+        declineBtn.textContent = "Decline";
+        declineBtn.onclick = async () => {
+          try {
+            await respondToPetition(petition.id, "DECLINE");
+            await refreshData();
+            setMessage(petitionMessage, "");
+          } catch (error) {
+            setMessage(petitionMessage, error.message || "Failed to respond", true);
+          }
+        };
+
+        actions.appendChild(acceptBtn);
+        actions.appendChild(declineBtn);
+      }
+
+      if (petition.status === "FAILED" && petition.createdByUserId === currentUserId) {
+        const deleteBtn = document.createElement("button");
+        deleteBtn.textContent = "Delete";
+        deleteBtn.onclick = async () => {
+          try {
+            await deletePetition(petition.id);
+            await refreshData();
+            setMessage(petitionMessage, "");
+          } catch (error) {
+            setMessage(petitionMessage, error.message || "Failed to delete petition", true);
+          }
+        };
+        actions.appendChild(deleteBtn);
+      }
+
+      petitionActions.appendChild(info);
+      petitionActions.appendChild(actions);
+    };
+
+    const refreshData = async () => {
+      selection = null;
+      updateSelectionPanel();
+      updateSelectionHighlight(0, 0);
+      setMessage(detailStatus, "Loading availability...");
+      try {
+        const [blocks, petitions] = await Promise.all([
+          fetchGroupAvailability(group.id, currentWeekStart),
+          fetchGroupPetitions(group.id)
+        ]);
+
+        petitionsCache = petitions;
+
+        renderAvailability({
+          root: gridContainer,
+          slots: blocks,
+          minFraction: 0,
+          interactive: true
+        });
+
+        renderPetitions({
+          root: gridContainer,
+          petitions: petitionsCache,
+          onSelect: (petition) => {
+            selection = null;
+            updateSelectionHighlight(0, 0);
+            updateSelectionPanel();
+            updatePetitionActions(petition);
+          }
+        });
+
+        setupSelectionHandlers();
+        updatePetitionActions(null);
+        setMessage(detailStatus, "");
+      } catch (error) {
+        setMessage(detailStatus, error.message || "Failed to load availability", true);
+      }
+    };
+
+    createPetitionBtn.onclick = async () => {
+      if (!selection) {
+        setMessage(petitionMessage, "Select a contiguous fully-free range first.", true);
+        return;
+      }
+
+      createPetitionBtn.disabled = true;
+      setMessage(petitionMessage, "Creating petition...");
+
+      try {
+        const payload = {
+          title: titleInput.value.trim() || "Petitioned Meeting",
+          start: selection.startMs,
+          end: selection.endMs,
+          priority: prioritySelect.value
+        };
+        await createPetition(group.id, payload);
+        titleInput.value = "";
+        clearSelection();
+        await refreshData();
+        setMessage(petitionMessage, "Petition created.");
+      } catch (error) {
+        setMessage(petitionMessage, error.message || "Failed to create petition", true);
+      } finally {
+        createPetitionBtn.disabled = false;
+      }
+    };
+
+    cancelSelectionBtn.onclick = () => {
+      clearSelection();
+      setMessage(petitionMessage, "");
+    };
+
+    gridContainer.addEventListener("click", () => {
+      updatePetitionActions(null);
+    });
+
+    await refreshData();
   };
 
   const loadGroups = async () => {

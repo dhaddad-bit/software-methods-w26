@@ -4,4 +4,15 @@
   right: 0;
   background-color: rgba(76, 175, 80, 0.35);
   pointer-events: none;
+  z-index: 2;
+}
+
+.availability-slot.selectable {
+  pointer-events: auto;
+  cursor: pointer;
+}
+
+.availability-slot.selected {
+  outline: 2px solid #2c3e50;
+  outline-offset: -1px;
 }

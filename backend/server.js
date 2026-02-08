@@ -107,6 +107,70 @@ function parseTimeParam(value) {
   return parsed;
 }
 
+const PETITION_GRANULARITY_MINUTES = 15;
+const PETITION_PRIORITY_DEFAULT = 'HIGHEST';
+
+async function buildParticipantsWithPetitions(groupId, windowStartMs, windowEndMs) {
+  const members = await db.getGroupMembersWithTokens(groupId);
+
+  const participants = await Promise.all(
+    members.map(async (member) => {
+      const intervals = await fetchBusyIntervalsForUser({
+        userId: String(member.id),
+        refreshToken: member.google_refresh_token,
+        windowStartMs,
+        windowEndMs
+      });
+      return { userId: String(member.id), events: intervals };
+    })
+  );
+
+  const participantsById = new Map(participants.map((p) => [p.userId, p]));
+
+  const petitions = await db.listPetitionsForAvailability({
+    groupId,
+    windowStartMs,
+    windowEndMs
+  });
+
+  petitions.forEach((petition) => {
+    if (petition.status === 'FAILED') return;
+    const startMs = Date.parse(petition.start_time);
+    const endMs = Date.parse(petition.end_time);
+    if (!Number.isFinite(startMs) || !Number.isFinite(endMs)) return;
+
+    const acceptedIds = Array.isArray(petition.accepted_user_ids)
+      ? petition.accepted_user_ids
+      : [];
+
+    acceptedIds.forEach((userId) => {
+      const participant = participantsById.get(String(userId));
+      if (!participant) return;
+
+      participant.events.push({
+        eventRef: `petition-${petition.id}`,
+        userId: String(userId),
+        startMs,
+        endMs,
+        source: 'petition',
+        blockingLevel: petition.priority || PETITION_PRIORITY_DEFAULT
+      });
+    });
+  });
+
+  return participants;
+}
+
+async function computeGroupAvailability({ groupId, windowStartMs, windowEndMs, granularityMinutes }) {
+  const participants = await buildParticipantsWithPetitions(groupId, windowStartMs, windowEndMs);
+  return computeAvailabilityBlocks({
+    windowStartMs,
+    windowEndMs,
+    participants,
+    granularityMinutes
+  });
+}
+
 // ===================PAGES========================
 
 app.get('/', (req, res) => {
@@ -265,6 +329,179 @@ app.post('/api/groups/:groupId/members', requireAuth, requireGroupMember, async 
   return res.status(200).json({ id: user.id, email: user.email, name: user.name });
 });
 
+// ===================PETITIONS========================
+
+app.post('/api/groups/:groupId/petitions', requireAuth, requireGroupMember, async (req, res) => {
+  const startMs = parseTimeParam(req.body?.start);
+  const endMs = parseTimeParam(req.body?.end);
+  const title = typeof req.body?.title === 'string' ? req.body.title.trim() : '';
+  let priority =
+    typeof req.body?.priority === 'string' && req.body.priority.trim()
+      ? req.body.priority.trim().toUpperCase()
+      : PETITION_PRIORITY_DEFAULT;
+  if (!['HIGHEST', 'HIGH', 'MEDIUM', 'LOW'].includes(priority)) {
+    priority = PETITION_PRIORITY_DEFAULT;
+  }
+
+  if (!Number.isFinite(startMs) || !Number.isFinite(endMs)) {
+    return res.status(400).json({ error: 'start and end are required (ISO or epoch ms)' });
+  }
+  if (endMs <= startMs) {
+    return res.status(400).json({ error: 'end must be greater than start' });
+  }
+
+  const blockMs = PETITION_GRANULARITY_MINUTES * 60 * 1000;
+  if (startMs % blockMs !== 0 || endMs % blockMs !== 0) {
+    return res.status(400).json({ error: 'start and end must align to 15-minute blocks' });
+  }
+
+  try {
+    const blocks = await computeGroupAvailability({
+      groupId: req.groupId,
+      windowStartMs: startMs,
+      windowEndMs: endMs,
+      granularityMinutes: PETITION_GRANULARITY_MINUTES
+    });
+
+    const windowBlocks = blocks.filter(
+      (block) => block.startMs >= startMs && block.endMs <= endMs
+    );
+    if (windowBlocks.length === 0) {
+      return res.status(400).json({ error: 'Invalid petition window' });
+    }
+
+    const allFree = windowBlocks.every((block) => block.availableCount === block.totalCount);
+    if (!allFree) {
+      return res
+        .status(400)
+        .json({ error: 'Selected window is not fully available for all members' });
+    }
+
+    const petition = await db.createPetition({
+      groupId: req.groupId,
+      createdByUserId: req.session.userId,
+      title: title || 'Petitioned Meeting',
+      startTime: new Date(startMs),
+      endTime: new Date(endMs),
+      priority: priority || PETITION_PRIORITY_DEFAULT,
+      status: 'OPEN'
+    });
+
+    await db.upsertPetitionResponse({
+      petitionId: petition.id,
+      userId: req.session.userId,
+      response: 'ACCEPTED'
+    });
+
+    const groupSize = await db.getGroupMemberCount(req.groupId);
+
+    return res.status(201).json({
+      ...petition,
+      group_name: req.group.name,
+      acceptedCount: 1,
+      declinedCount: 0,
+      groupSize,
+      currentUserResponse: 'ACCEPTED'
+    });
+  } catch (error) {
+    if (error.code === 'NO_REFRESH_TOKEN') {
+      return res.status(400).json({ error: 'One or more members need to re-authenticate.' });
+    }
+    console.error('Error creating petition', error);
+    return res.status(500).json({ error: 'Failed to create petition' });
+  }
+});
+
+app.get('/api/groups/:groupId/petitions', requireAuth, requireGroupMember, async (req, res) => {
+  const petitions = await db.listGroupPetitions({
+    groupId: req.groupId,
+    userId: req.session.userId
+  });
+  return res.json(petitions);
+});
+
+app.get('/api/petitions', requireAuth, async (req, res) => {
+  const petitions = await db.listUserPetitions({ userId: req.session.userId });
+  return res.json(petitions);
+});
+
+app.post('/api/petitions/:petitionId/respond', requireAuth, async (req, res) => {
+  const petitionId = Number.parseInt(req.params.petitionId, 10);
+  if (!Number.isInteger(petitionId)) {
+    return res.status(400).json({ error: 'Invalid petitionId' });
+  }
+
+  const responseValue = typeof req.body?.response === 'string' ? req.body.response.trim() : '';
+  if (!['ACCEPT', 'DECLINE'].includes(responseValue.toUpperCase())) {
+    return res.status(400).json({ error: 'response must be ACCEPT or DECLINE' });
+  }
+  const normalizedResponse = responseValue.toUpperCase() === 'ACCEPT' ? 'ACCEPTED' : 'DECLINED';
+
+  const petition = await db.getPetitionById(petitionId);
+  if (!petition) {
+    return res.status(404).json({ error: 'Petition not found' });
+  }
+
+  const isMember = await db.isUserInGroup(petition.group_id, req.session.userId);
+  if (!isMember) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+
+  await db.upsertPetitionResponse({
+    petitionId,
+    userId: req.session.userId,
+    response: normalizedResponse
+  });
+
+  const counts = await db.getPetitionResponseCounts(petitionId);
+  const acceptedCount = Number.parseInt(counts.accepted_count, 10) || 0;
+  const declinedCount = Number.parseInt(counts.declined_count, 10) || 0;
+  const groupSize = await db.getGroupMemberCount(petition.group_id);
+
+  let nextStatus = 'OPEN';
+  if (declinedCount > 0) {
+    nextStatus = 'FAILED';
+  } else if (acceptedCount === groupSize) {
+    nextStatus = 'ACCEPTED_ALL';
+  }
+
+  let updatedPetition = petition;
+  if (petition.status !== nextStatus) {
+    updatedPetition = await db.updatePetitionStatus(petitionId, nextStatus);
+  }
+
+  return res.json({
+    ...updatedPetition,
+    acceptedCount,
+    declinedCount,
+    groupSize,
+    currentUserResponse: normalizedResponse
+  });
+});
+
+app.delete('/api/petitions/:petitionId', requireAuth, async (req, res) => {
+  const petitionId = Number.parseInt(req.params.petitionId, 10);
+  if (!Number.isInteger(petitionId)) {
+    return res.status(400).json({ error: 'Invalid petitionId' });
+  }
+
+  const petition = await db.getPetitionById(petitionId);
+  if (!petition) {
+    return res.status(404).json({ error: 'Petition not found' });
+  }
+
+  if (petition.created_by_user_id !== req.session.userId) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+
+  if (petition.status !== 'FAILED') {
+    return res.status(400).json({ error: 'Only FAILED petitions can be deleted' });
+  }
+
+  await db.deletePetition(petitionId);
+  return res.json({ ok: true });
+});
+
 // ===================AVAILABILITY========================
 
 app.get('/api/groups/:groupId/availability', requireAuth, requireGroupMember, async (req, res) => {
@@ -288,31 +525,12 @@ app.get('/api/groups/:groupId/availability', requireAuth, requireGroupMember, as
   }
 
   try {
-    const members = await db.getGroupMembersWithTokens(req.groupId);
-
-    const participants = await Promise.all(
-      members.map(async (member) => {
-        const intervals = await fetchBusyIntervalsForUser({
-          userId: String(member.id),
-          refreshToken: member.google_refresh_token,
-          windowStartMs,
-          windowEndMs
-        });
-        return { userId: String(member.id), events: intervals };
-      })
-    );
-
-    const args = {
+    const blocks = await computeGroupAvailability({
+      groupId: req.groupId,
       windowStartMs,
       windowEndMs,
-      participants
-    };
-
-    if (granularityMinutes) {
-      args.granularityMinutes = granularityMinutes;
-    }
-
-    const blocks = await computeAvailabilityBlocks(args);
+      granularityMinutes: granularityMinutes || undefined
+    });
     return res.json(blocks);
   } catch (error) {
     if (error.code === 'NO_REFRESH_TOKEN') {

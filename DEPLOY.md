@@ -54,8 +54,11 @@ Set **exactly these 6** in Render:
 
 ## 5) Migrations / Schema Updates
 - The MVP schema lives in `db/table_initialization.sql`.
-- Only these tables exist for MVP: `users`, `groups`, `group_memberships`, plus the `session` table used by `connect-pg-simple`.
-- No calendar or event tables exist or are created.
+- Tables for MVP:
+  - `users`, `groups`, `group_memberships` (core auth + groups)
+  - `petitions`, `petition_responses` (petitioned meeting blocks)
+  - plus the `session` table used by `connect-pg-simple`
+- No Google Calendar events are stored in DB (petitions are first‑class records).
 
 ## 6) Verify End-to-End
 1. Navigate to `/login` and sign in with Google OAuth.
@@ -66,8 +69,13 @@ Set **exactly these 6** in Render:
    - `POST /api/groups/:groupId/members` with `{ "email": "member@example.com" }`
 5. Fetch group availability:
    - `GET /api/groups/:groupId/availability?start=...&end=...&granularity=...`
+6. Petition flow:
+   - Select darkest‑green blocks in Group View and create petition.
+   - Second user logs in and Accepts/Declines.
+   - Decline → petition FAILED, creator can delete.
+   - Accept‑all → petition ACCEPTED_ALL and persists.
 
 ## 7) Proof That Calendar Events Are Not Persisted
 - The only persisted tables are `users`, `groups`, `group_memberships` (plus the session table for server sessions).
-- Calendar events are fetched from Google on-demand and used in memory only, then discarded.
-- There are **no** event or calendar snapshot tables in the MVP schema.
+- Petitions are stored in DB; Google Calendar events are fetched on-demand and discarded.
+- There are **no** Google event or calendar snapshot tables in the MVP schema.

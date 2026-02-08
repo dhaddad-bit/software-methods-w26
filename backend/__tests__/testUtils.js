@@ -3,7 +3,7 @@ const path = require('path');
 const db = require('../db');
 
 async function runMigrations() {
-  const sqlPath = path.join(__dirname, '..', '..', 'db', 'table_initialization.sql');
+  const sqlPath = path.join(__dirname, '..', 'db', 'table_initialization.sql');
   const sql = fs.readFileSync(sqlPath, 'utf8');
   const statements = sql
     .split(';')
@@ -16,7 +16,9 @@ async function runMigrations() {
 }
 
 async function resetDb() {
-  await db.query('TRUNCATE TABLE group_memberships, groups, users RESTART IDENTITY CASCADE');
+  await db.query(
+    'TRUNCATE TABLE petition_responses, petitions, group_memberships, groups, users RESTART IDENTITY CASCADE'
+  );
 }
 
 async function createUser({ googleSub, email, name, refreshToken }) {

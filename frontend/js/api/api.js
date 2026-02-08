@@ -14,3 +14,11 @@ export async function apiPost(path, data) {
   });
   return response.json();
 }
+
+export async function apiDelete(path) {
+  const response = await fetch(path, {
+    method: "DELETE",
+    credentials: "include"
+  });
+  return response.json();
+}

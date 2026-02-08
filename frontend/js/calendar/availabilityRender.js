@@ -29,6 +29,7 @@ export function renderAvailability(options = {}) {
   const root = options.root || document;
   const slots = Array.isArray(options.slots) ? options.slots : mockAvailability;
   const minFraction = typeof options.minFraction === "number" ? options.minFraction : 0;
+  const interactive = Boolean(options.interactive);
 
   const cells = root.querySelectorAll(".calendar-cell");
   root.querySelectorAll(".availability-block").forEach((el) => el.remove());
@@ -55,7 +56,7 @@ export function renderAvailability(options = {}) {
       if (overlapEndMs <= overlapStartMs) return;
 
       const overlay = document.createElement("div");
-      overlay.className = "availability-block";
+      overlay.className = "availability-block availability-slot";
 
       const top = (overlapStartMs - cellStart.getTime()) / (1000 * 60);
       const height = (overlapEndMs - overlapStartMs) / (1000 * 60);
@@ -68,6 +69,26 @@ export function renderAvailability(options = {}) {
       } else {
         overlay.style.top = "0";
         overlay.style.height = "100%";
+      }
+
+      const slotStartMs = slot.start.getTime();
+      const slotEndMs = slot.end.getTime();
+      overlay.dataset.startMs = String(slotStartMs);
+      overlay.dataset.endMs = String(slotEndMs);
+      if (slot.availableCount !== null) {
+        overlay.dataset.availableCount = String(slot.availableCount);
+      }
+      if (slot.totalCount !== null) {
+        overlay.dataset.totalCount = String(slot.totalCount);
+      }
+
+      const isFullyFree =
+        slot.availableCount !== null &&
+        slot.totalCount !== null &&
+        slot.availableCount === slot.totalCount;
+
+      if (interactive && isFullyFree) {
+        overlay.classList.add("selectable");
       }
 
       if (slot.availableCount !== null && slot.totalCount !== null) {

@@ -193,6 +193,165 @@ const getGroupMembersWithTokens = async (groupId) => {
   return result.rows;
 };
 
+const createPetition = async ({
+  groupId,
+  createdByUserId,
+  title,
+  startTime,
+  endTime,
+  priority = 'HIGHEST',
+  status = 'OPEN'
+}) => {
+  const result = await pool.query(
+    `INSERT INTO petitions (group_id, created_by_user_id, title, start_time, end_time, priority, status)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)
+     RETURNING id, group_id, created_by_user_id, title, start_time, end_time, priority, status, created_at, updated_at`,
+    [groupId, createdByUserId, title, startTime, endTime, priority, status]
+  );
+  return result.rows[0];
+};
+
+const getPetitionById = async (petitionId) => {
+  const result = await pool.query(
+    `SELECT id, group_id, created_by_user_id, title, start_time, end_time, priority, status, created_at, updated_at
+     FROM petitions
+     WHERE id = $1`,
+    [petitionId]
+  );
+  return result.rows[0];
+};
+
+const listGroupPetitions = async ({ groupId, userId }) => {
+  const result = await pool.query(
+    `SELECT p.id, p.group_id, p.created_by_user_id, p.title, p.start_time, p.end_time, p.priority, p.status,
+            p.created_at, p.updated_at,
+            g.name AS group_name,
+            COUNT(DISTINCT gm.user_id) AS group_size,
+            COUNT(DISTINCT pr_accept.user_id) AS accepted_count,
+            COUNT(DISTINCT pr_decline.user_id) AS declined_count,
+            cur.response AS current_user_response
+     FROM petitions p
+     INNER JOIN groups g ON g.id = p.group_id
+     INNER JOIN group_memberships gm ON gm.group_id = p.group_id
+     LEFT JOIN petition_responses pr_accept
+       ON pr_accept.petition_id = p.id AND pr_accept.response = 'ACCEPTED'
+     LEFT JOIN petition_responses pr_decline
+       ON pr_decline.petition_id = p.id AND pr_decline.response = 'DECLINED'
+     LEFT JOIN petition_responses cur
+       ON cur.petition_id = p.id AND cur.user_id = $2
+     WHERE p.group_id = $1
+     GROUP BY p.id, g.name, cur.response
+     ORDER BY p.start_time, p.id`,
+    [groupId, userId]
+  );
+  return result.rows;
+};
+
+const listUserPetitions = async ({ userId }) => {
+  const result = await pool.query(
+    `SELECT p.id, p.group_id, p.created_by_user_id, p.title, p.start_time, p.end_time, p.priority, p.status,
+            p.created_at, p.updated_at,
+            g.name AS group_name,
+            COUNT(DISTINCT gm_all.user_id) AS group_size,
+            COUNT(DISTINCT pr_accept.user_id) AS accepted_count,
+            COUNT(DISTINCT pr_decline.user_id) AS declined_count,
+            cur.response AS current_user_response
+     FROM petitions p
+     INNER JOIN groups g ON g.id = p.group_id
+     INNER JOIN group_memberships gm_user
+       ON gm_user.group_id = p.group_id AND gm_user.user_id = $1
+     INNER JOIN group_memberships gm_all
+       ON gm_all.group_id = p.group_id
+     LEFT JOIN petition_responses pr_accept
+       ON pr_accept.petition_id = p.id AND pr_accept.response = 'ACCEPTED'
+     LEFT JOIN petition_responses pr_decline
+       ON pr_decline.petition_id = p.id AND pr_decline.response = 'DECLINED'
+     LEFT JOIN petition_responses cur
+       ON cur.petition_id = p.id AND cur.user_id = $1
+     GROUP BY p.id, g.name, cur.response
+     ORDER BY p.start_time, p.id`,
+    [userId]
+  );
+  return result.rows;
+};
+
+const upsertPetitionResponse = async ({ petitionId, userId, response }) => {
+  const result = await pool.query(
+    `INSERT INTO petition_responses (petition_id, user_id, response)
+     VALUES ($1, $2, $3)
+     ON CONFLICT (petition_id, user_id)
+     DO UPDATE SET response = EXCLUDED.response, responded_at = NOW()
+     RETURNING petition_id, user_id, response, responded_at`,
+    [petitionId, userId, response]
+  );
+  return result.rows[0];
+};
+
+const getPetitionResponseCounts = async (petitionId) => {
+  const result = await pool.query(
+    `SELECT
+        COUNT(*) FILTER (WHERE response = 'ACCEPTED') AS accepted_count,
+        COUNT(*) FILTER (WHERE response = 'DECLINED') AS declined_count
+     FROM petition_responses
+     WHERE petition_id = $1`,
+    [petitionId]
+  );
+  return result.rows[0];
+};
+
+const updatePetitionStatus = async (petitionId, status) => {
+  const result = await pool.query(
+    `UPDATE petitions
+     SET status = $2, updated_at = NOW()
+     WHERE id = $1
+     RETURNING id, group_id, created_by_user_id, title, start_time, end_time, priority, status, created_at, updated_at`,
+    [petitionId, status]
+  );
+  return result.rows[0];
+};
+
+const deletePetition = async (petitionId) => {
+  await pool.query(`DELETE FROM petitions WHERE id = $1`, [petitionId]);
+};
+
+const listPetitionsForAvailability = async ({ groupId, windowStartMs, windowEndMs }) => {
+  const result = await pool.query(
+    `SELECT p.id, p.group_id, p.created_by_user_id, p.title, p.start_time, p.end_time, p.priority, p.status,
+            ARRAY_REMOVE(ARRAY_AGG(pr.user_id) FILTER (WHERE pr.response = 'ACCEPTED'), NULL) AS accepted_user_ids
+     FROM petitions p
+     LEFT JOIN petition_responses pr ON pr.petition_id = p.id
+     WHERE p.group_id = $1
+       AND p.status != 'FAILED'
+       AND p.start_time < $3
+       AND p.end_time > $2
+     GROUP BY p.id
+     ORDER BY p.start_time`,
+    [groupId, new Date(windowStartMs), new Date(windowEndMs)]
+  );
+  return result.rows;
+};
+
+const getGroupMemberCount = async (groupId) => {
+  const result = await pool.query(
+    `SELECT COUNT(*)::int AS count
+     FROM group_memberships
+     WHERE group_id = $1`,
+    [groupId]
+  );
+  return result.rows[0]?.count || 0;
+};
+
+const getGroupMemberIds = async (groupId) => {
+  const result = await pool.query(
+    `SELECT user_id
+     FROM group_memberships
+     WHERE group_id = $1
+     ORDER BY user_id`,
+    [groupId]
+  );
+  return result.rows.map((row) => row.user_id);
+};
+
 module.exports = {
   pool,
   query: (text, params) => pool.query(text, params),
@@ -206,5 +365,16 @@ module.exports = {
   isUserInGroup,
   addGroupMember,
   getGroupMembers,
-  getGroupMembersWithTokens
+  getGroupMembersWithTokens,
+  createPetition,
+  getPetitionById,
+  listGroupPetitions,
+  listUserPetitions,
+  upsertPetitionResponse,
+  getPetitionResponseCounts,
+  updatePetitionStatus,
+  deletePetition,
+  listPetitionsForAvailability,
+  getGroupMemberCount,
+  getGroupMemberIds
 };

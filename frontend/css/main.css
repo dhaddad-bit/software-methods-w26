@@ -142,3 +142,65 @@ button:hover {
 .group-calendar {
   margin-top: 10px;
 }
+
+.petition-message {
+  text-align: center;
+  min-height: 20px;
+  margin: 6px 0;
+  font-size: 14px;
+  color: #2c3e50;
+}
+
+.petition-message[data-type="error"] {
+  color: #c0392b;
+}
+
+.petition-panel {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: center;
+  align-items: center;
+  margin: 12px 0;
+  padding: 10px;
+  border: 1px dashed #ccc;
+  border-radius: 6px;
+  background: #f9f9f9;
+}
+
+.petition-panel-info {
+  flex-basis: 100%;
+  text-align: center;
+  font-size: 14px;
+  color: #333;
+}
+
+.petition-input,
+.petition-select {
+  padding: 6px 10px;
+  font-size: 14px;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+  font-family: 'Courier New', Courier, monospace;
+}
+
+.petition-action-bar {
+  margin-top: 12px;
+  padding: 10px;
+  border: 1px solid #e0e0e0;
+  border-radius: 6px;
+  background: #fafafa;
+  text-align: center;
+}
+
+.petition-action-info {
+  margin-bottom: 8px;
+  font-size: 14px;
+  color: #333;
+}
+
+.petition-action-buttons {
+  display: flex;
+  gap: 8px;
+  justify-content: center;
+}
