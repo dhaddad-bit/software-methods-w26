@@ -127,8 +127,9 @@ async function buildParticipantsWithPetitions(groupId, windowStartMs, windowEndM
 
   const participantsById = new Map(participants.map((p) => [p.userId, p]));
 
+  const memberIds = members.map((member) => member.id);
   const petitions = await db.listPetitionsForAvailability({
-    groupId,
+    userIds: memberIds,
     windowStartMs,
     windowEndMs
   });

@@ -314,19 +314,31 @@ const deletePetition = async (petitionId) => {
   await pool.query(`DELETE FROM petitions WHERE id = $1`, [petitionId]);
 };
 
-const listPetitionsForAvailability = async ({ groupId, windowStartMs, windowEndMs }) => {
+const listPetitionsForAvailability = async ({ userIds, windowStartMs, windowEndMs }) => {
+  if (!Array.isArray(userIds) || userIds.length === 0) {
+    return [];
+  }
+
   const result = await pool.query(
     `SELECT p.id, p.group_id, p.created_by_user_id, p.title, p.start_time, p.end_time, p.priority, p.status,
             ARRAY_REMOVE(ARRAY_AGG(pr.user_id) FILTER (WHERE pr.response = 'ACCEPTED'), NULL) AS accepted_user_ids
      FROM petitions p
-     LEFT JOIN petition_responses pr ON pr.petition_id = p.id
-     WHERE p.group_id = $1
-       AND p.status != 'FAILED'
+     LEFT JOIN petition_responses pr
+       ON pr.petition_id = p.id
+       AND pr.user_id = ANY($1)
+     WHERE p.status != 'FAILED'
        AND p.start_time < $3
        AND p.end_time > $2
+       AND EXISTS (
+         SELECT 1
+         FROM petition_responses pr2
+         WHERE pr2.petition_id = p.id
+           AND pr2.response = 'ACCEPTED'
+           AND pr2.user_id = ANY($1)
+       )
      GROUP BY p.id
      ORDER BY p.start_time`,
-    [groupId, new Date(windowStartMs), new Date(windowEndMs)]
+    [userIds, new Date(windowStartMs), new Date(windowEndMs)]
   );
   return result.rows;
 };

@@ -157,6 +157,38 @@ test('accept all marks petition ACCEPTED_ALL and blocks availability', async () 
   expect(firstBlock.availableCount).toBe(0);
 });
 
+test('accepted petition in another group blocks availability', async () => {
+  const { agentA, agentB, userB, groupId } = await setupGroup();
+
+  fetchBusyIntervalsForUser.mockResolvedValue([]);
+
+  const groupBRes = await agentA.post('/api/groups').send({ name: 'Group B' }).expect(201);
+  const groupBId = groupBRes.body.id;
+  await agentA.post(`/api/groups/${groupBId}/members`).send({ email: userB.email }).expect(200);
+
+  const start = Date.UTC(2026, 0, 6, 10, 0, 0);
+  const end = Date.UTC(2026, 0, 6, 11, 0, 0);
+
+  const createRes = await agentA
+    .post(`/api/groups/${groupId}/petitions`)
+    .send({ start, end })
+    .expect(201);
+
+  const petitionId = createRes.body.id;
+
+  await agentB
+    .post(`/api/petitions/${petitionId}/respond`)
+    .send({ response: 'ACCEPT' })
+    .expect(200);
+
+  const availability = await agentA
+    .get(`/api/groups/${groupBId}/availability?start=${start}&end=${end}&granularity=15`)
+    .expect(200);
+
+  const firstBlock = availability.body.find((block) => block.startMs === start);
+  expect(firstBlock.availableCount).toBe(0);
+});
+
 test('server-side validation rejects non-free petition window', async () => {
   const { agentA, groupId, userA } = await setupGroup();
 

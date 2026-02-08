@@ -221,6 +221,20 @@ export async function renderGroups() {
   const selectionInfo = document.createElement("div");
   selectionInfo.className = "petition-panel-info";
 
+  const startInput = document.createElement("input");
+  startInput.type = "datetime-local";
+  startInput.step = String(BLOCK_MS / 1000);
+  startInput.className = "petition-input";
+
+  const endInput = document.createElement("input");
+  endInput.type = "datetime-local";
+  endInput.step = String(BLOCK_MS / 1000);
+  endInput.className = "petition-input";
+
+  const applyRangeBtn = document.createElement("button");
+  applyRangeBtn.type = "button";
+  applyRangeBtn.textContent = "Apply Range";
+
   const titleInput = document.createElement("input");
   titleInput.type = "text";
   titleInput.placeholder = "Petition title";
@@ -243,6 +257,9 @@ export async function renderGroups() {
   cancelSelectionBtn.textContent = "Cancel";
 
   selectionPanel.appendChild(selectionInfo);
+  selectionPanel.appendChild(startInput);
+  selectionPanel.appendChild(endInput);
+  selectionPanel.appendChild(applyRangeBtn);
   selectionPanel.appendChild(titleInput);
   selectionPanel.appendChild(prioritySelect);
   selectionPanel.appendChild(createPetitionBtn);
@@ -279,6 +296,8 @@ export async function renderGroups() {
     let isSelecting = false;
     let anchorStartMs = null;
     let anchorEndMs = null;
+    let tapAnchorMs = null;
+    let didDragSelect = false;
     let petitionsCache = [];
 
     const header = document.createElement("div");
@@ -324,20 +343,44 @@ export async function renderGroups() {
 
     const clearSelection = () => {
       selection = null;
+      tapAnchorMs = null;
+      anchorStartMs = null;
+      anchorEndMs = null;
       updateSelectionHighlight(0, 0);
-      selectionPanel.hidden = true;
+      startInput.value = "";
+      endInput.value = "";
+      updateSelectionPanel();
+    };
+
+    const formatDateTimeLocal = (ms) => {
+      const date = new Date(ms);
+      const local = new Date(date.getTime() - date.getTimezoneOffset() * 60000);
+      return local.toISOString().slice(0, 16);
+    };
+
+    const parseDateTimeLocal = (value) => {
+      if (!value) return null;
+      const ms = Date.parse(value);
+      return Number.isNaN(ms) ? null : ms;
+    };
+
+    const updateInputsFromSelection = () => {
+      if (!selection) return;
+      startInput.value = formatDateTimeLocal(selection.startMs);
+      endInput.value = formatDateTimeLocal(selection.endMs);
     };
 
     const updateSelectionPanel = () => {
+      selectionPanel.hidden = false;
       if (!selection) {
-        selectionPanel.hidden = true;
+        selectionInfo.textContent = "Select a contiguous fully-free range or enter start/end.";
         return;
       }
       selectionInfo.textContent = `${formatRange(selection.startMs, selection.endMs)} (${(
         (selection.endMs - selection.startMs) /
         (60 * 1000)
       ).toFixed(0)} mins)`;
-      selectionPanel.hidden = false;
+      updateInputsFromSelection();
     };
 
     const validateRange = (rangeStartMs, rangeEndMs) => {
@@ -358,6 +401,8 @@ export async function renderGroups() {
       const endMs = Number(slot.dataset.endMs);
       if (!Number.isFinite(startMs) || !Number.isFinite(endMs)) return;
 
+      tapAnchorMs = null;
+      didDragSelect = false;
       isSelecting = true;
       anchorStartMs = startMs;
       anchorEndMs = endMs;
@@ -383,6 +428,7 @@ export async function renderGroups() {
         return;
       }
 
+      didDragSelect = true;
       setMessage(petitionMessage, "");
       selection = { startMs: rangeStartMs, endMs: rangeEndMs };
       updateSelectionHighlight(rangeStartMs, rangeEndMs);
@@ -392,6 +438,45 @@ export async function renderGroups() {
     const handlePointerUp = () => {
       if (!isSelecting) return;
       isSelecting = false;
+      updateSelectionPanel();
+    };
+
+    const handleTapSelect = (event) => {
+      if (isSelecting) return;
+      if (didDragSelect) {
+        didDragSelect = false;
+        return;
+      }
+
+      const slot = event.target.closest(".availability-slot.selectable");
+      if (!slot) return;
+
+      const startMs = Number(slot.dataset.startMs);
+      const endMs = Number(slot.dataset.endMs);
+      if (!Number.isFinite(startMs) || !Number.isFinite(endMs)) return;
+
+      if (tapAnchorMs === null) {
+        tapAnchorMs = startMs;
+        selection = { startMs, endMs };
+        updateSelectionHighlight(startMs, endMs);
+        updateSelectionPanel();
+        setMessage(petitionMessage, "Tap an end time to finish selection.", false);
+        return;
+      }
+
+      const anchorEnd = tapAnchorMs + BLOCK_MS;
+      const rangeStartMs = Math.min(tapAnchorMs, startMs);
+      const rangeEndMs = Math.max(anchorEnd, endMs);
+
+      if (!validateRange(rangeStartMs, rangeEndMs)) {
+        setMessage(petitionMessage, "Selection must be contiguous fully-free blocks.", true);
+        return;
+      }
+
+      setMessage(petitionMessage, "");
+      tapAnchorMs = null;
+      selection = { startMs: rangeStartMs, endMs: rangeEndMs };
+      updateSelectionHighlight(rangeStartMs, rangeEndMs);
       updateSelectionPanel();
     };
 
@@ -406,6 +491,7 @@ export async function renderGroups() {
 
       gridContainer.addEventListener("pointerdown", handlePointerDown);
       gridContainer.addEventListener("pointerover", handlePointerOver);
+      gridContainer.addEventListener("click", handleTapSelect);
 
       if (windowPointerUpHandler) {
         window.removeEventListener("pointerup", windowPointerUpHandler);
@@ -476,9 +562,7 @@ export async function renderGroups() {
     };
 
     const refreshData = async () => {
-      selection = null;
-      updateSelectionPanel();
-      updateSelectionHighlight(0, 0);
+      clearSelection();
       setMessage(detailStatus, "Loading availability...");
       try {
         const [blocks, petitions] = await Promise.all([
@@ -499,9 +583,7 @@ export async function renderGroups() {
           root: gridContainer,
           petitions: petitionsCache,
           onSelect: (petition) => {
-            selection = null;
-            updateSelectionHighlight(0, 0);
-            updateSelectionPanel();
+            clearSelection();
             updatePetitionActions(petition);
           }
         });
@@ -512,6 +594,41 @@ export async function renderGroups() {
       } catch (error) {
         setMessage(detailStatus, error.message || "Failed to load availability", true);
       }
+    };
+
+    applyRangeBtn.onclick = () => {
+      const startMs = parseDateTimeLocal(startInput.value);
+      const endMs = parseDateTimeLocal(endInput.value);
+
+      if (!Number.isFinite(startMs) || !Number.isFinite(endMs)) {
+        setMessage(petitionMessage, "Enter valid start and end times.", true);
+        return;
+      }
+      if (endMs <= startMs) {
+        setMessage(petitionMessage, "End time must be after start time.", true);
+        return;
+      }
+      if (startMs % BLOCK_MS !== 0 || endMs % BLOCK_MS !== 0) {
+        setMessage(petitionMessage, "Times must align to 15-minute blocks.", true);
+        return;
+      }
+
+      const weekWindow = getWeekWindow(currentWeekStart);
+      if (startMs < weekWindow.startMs || endMs > weekWindow.endMs) {
+        setMessage(petitionMessage, "Range must be within the visible week.", true);
+        return;
+      }
+
+      if (!validateRange(startMs, endMs)) {
+        setMessage(petitionMessage, "Range must be fully-free contiguous blocks.", true);
+        return;
+      }
+
+      tapAnchorMs = null;
+      selection = { startMs, endMs };
+      updateSelectionHighlight(startMs, endMs);
+      updateSelectionPanel();
+      setMessage(petitionMessage, "");
     };
 
     createPetitionBtn.onclick = async () => {
