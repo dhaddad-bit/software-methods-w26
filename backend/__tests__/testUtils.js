@@ -2,6 +2,15 @@ const fs = require('fs');
 const path = require('path');
 const db = require('../db');
 
+function checkDbSafety() {
+  const dbName = process.env.DB_NAME || '';
+  if (!dbName.toLowerCase().includes('test')) {
+    throw new Error(
+      `Unsafe DB_NAME "${dbName || 'undefined'}" for tests. Set DB_NAME to a dedicated test database (must include "test").`
+    );
+  }
+}
+
 async function runMigrations() {
   const sqlPath = path.join(__dirname, '..', 'db', 'table_initialization.sql');
   const sql = fs.readFileSync(sqlPath, 'utf8');
@@ -32,7 +41,9 @@ async function createUser({ googleSub, email, name, refreshToken }) {
 }
 
 module.exports = {
+  checkDbSafety,
   runMigrations,
   resetDb,
-  createUser
+  createUser,
+  teardown: async () => db.pool.end()
 };
