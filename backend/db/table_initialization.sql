@@ -77,15 +77,13 @@ CREATE TABLE IF NOT EXISTS cal_event (
   priority INTEGER DEFAULT 1
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS uniq_cal_event_gcal
-  ON cal_event (calendar_id, gcal_event_id);
-
 CREATE INDEX IF NOT EXISTS idx_calendar_user
   ON calendar (user_id);
 
 CREATE INDEX IF NOT EXISTS idx_cal_event_calendar_start
   ON cal_event (calendar_id, event_start);
 
+ALTER TABLE cal_event DROP CONSTRAINT IF EXISTS cal_event_time_order_chk;
 ALTER TABLE cal_event
   ADD CONSTRAINT cal_event_time_order_chk
   CHECK (event_end > event_start);

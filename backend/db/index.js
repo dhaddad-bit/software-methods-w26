@@ -376,36 +376,303 @@ const upsertCalendarForUser = async ({ userId, gcalId = 'primary', calendarName 
   return result.rows[0];
 };
 
+const getOrCreateCalendar = upsertCalendarForUser;
+
+const getCalendarSyncState = async (calendarId) => {
+  const result = await pool.query(
+    `SELECT calendar_id, sync_token, last_synced_at, last_full_synced_at, last_error, updated_at
+     FROM calendar_sync_state
+     WHERE calendar_id = $1`,
+    [calendarId]
+  );
+  return result.rows[0] || null;
+};
+
+const upsertCalendarSyncState = async ({
+  calendarId,
+  syncToken,
+  lastSyncedAt,
+  lastFullSyncedAt,
+  lastError
+}) => {
+  const result = await pool.query(
+    `INSERT INTO calendar_sync_state (calendar_id, sync_token, last_synced_at, last_full_synced_at, last_error)
+     VALUES ($1, $2, $3, $4, $5)
+     ON CONFLICT (calendar_id)
+     DO UPDATE SET
+       sync_token = EXCLUDED.sync_token,
+       last_synced_at = EXCLUDED.last_synced_at,
+       last_full_synced_at = EXCLUDED.last_full_synced_at,
+       last_error = EXCLUDED.last_error,
+       updated_at = NOW()
+     RETURNING calendar_id, sync_token, last_synced_at, last_full_synced_at, last_error, updated_at`,
+    [calendarId, syncToken ?? null, lastSyncedAt ?? null, lastFullSyncedAt ?? null, lastError ?? null]
+  );
+  return result.rows[0];
+};
+
+const upsertCalEvents = async (calendarId, events) => {
+  if (!Array.isArray(events) || events.length === 0) {
+    return { inserted: 0, updated: 0 };
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    let inserted = 0;
+    let updated = 0;
+
+    for (const event of events) {
+      if (!event || !event.providerEventId || !event.start || !event.end) {
+        continue;
+      }
+
+      const result = await client.query(
+        `INSERT INTO cal_event (
+           calendar_id,
+           provider_event_id,
+           ical_uid,
+           recurring_event_id,
+           original_start_time,
+           event_name,
+           event_start,
+           event_end,
+           status,
+           provider_updated_at,
+           etag,
+           last_synced_at
+         )
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW())
+         ON CONFLICT (calendar_id, provider_event_id)
+         DO UPDATE SET
+           ical_uid = EXCLUDED.ical_uid,
+           recurring_event_id = EXCLUDED.recurring_event_id,
+           original_start_time = EXCLUDED.original_start_time,
+           event_name = EXCLUDED.event_name,
+           event_start = EXCLUDED.event_start,
+           event_end = EXCLUDED.event_end,
+           status = EXCLUDED.status,
+           provider_updated_at = EXCLUDED.provider_updated_at,
+           etag = EXCLUDED.etag,
+           last_synced_at = EXCLUDED.last_synced_at
+         RETURNING (xmax = 0) AS inserted`,
+        [
+          calendarId,
+          event.providerEventId,
+          event.iCalUID ?? null,
+          event.recurringEventId ?? null,
+          event.originalStartTime ?? null,
+          event.title ?? null,
+          event.start,
+          event.end,
+          event.status ?? 'confirmed',
+          event.providerUpdatedAt ?? null,
+          event.etag ?? null
+        ]
+      );
+
+      const wasInserted = result.rows[0]?.inserted === true;
+      if (wasInserted) inserted += 1;
+      else updated += 1;
+    }
+
+    await client.query('COMMIT');
+    return { inserted, updated };
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+};
+
+const markCalEventsCancelled = async (calendarId, providerEventIds) => {
+  if (!Array.isArray(providerEventIds) || providerEventIds.length === 0) {
+    return 0;
+  }
+
+  const result = await pool.query(
+    `UPDATE cal_event
+     SET status = 'cancelled',
+         last_synced_at = NOW()
+     WHERE calendar_id = $1
+       AND provider_event_id = ANY($2::text[])`,
+    [calendarId, providerEventIds]
+  );
+  return result.rowCount;
+};
+
+const listGoogleEventsForUser = async ({ userId, windowStartMs, windowEndMs }) => {
+  const start = new Date(windowStartMs);
+  const end = new Date(windowEndMs);
+  const result = await pool.query(
+    `SELECT e.event_id,
+            e.provider_event_id,
+            e.ical_uid,
+            e.event_name,
+            e.event_start,
+            e.event_end,
+            e.status,
+            e.blocking_level
+     FROM cal_event e
+     INNER JOIN calendar c ON c.calendar_id = e.calendar_id
+     WHERE c.user_id = $1
+       AND e.status != 'cancelled'
+       AND e.event_start < $3
+       AND e.event_end > $2
+     ORDER BY e.event_start, e.event_id`,
+    [userId, start, end]
+  );
+  return result.rows;
+};
+
+const listGoogleEventsForUsers = async ({ userIds, windowStartMs, windowEndMs }) => {
+  if (!Array.isArray(userIds) || userIds.length === 0) {
+    return [];
+  }
+  const start = new Date(windowStartMs);
+  const end = new Date(windowEndMs);
+
+  const result = await pool.query(
+    `SELECT c.user_id,
+            e.event_id,
+            e.provider_event_id,
+            e.event_start,
+            e.event_end,
+            e.status,
+            e.blocking_level
+     FROM cal_event e
+     INNER JOIN calendar c ON c.calendar_id = e.calendar_id
+     WHERE c.user_id = ANY($1)
+       AND e.status != 'cancelled'
+       AND e.event_start < $3
+       AND e.event_end > $2
+     ORDER BY c.user_id, e.event_start, e.event_id`,
+    [userIds, start, end]
+  );
+
+  return result.rows;
+};
+
+const updateGoogleEventBlockingLevel = async ({ userId, eventId, blockingLevel }) => {
+  const result = await pool.query(
+    `UPDATE cal_event e
+     SET blocking_level = $1
+     FROM calendar c
+     WHERE e.event_id = $2
+       AND e.calendar_id = c.calendar_id
+       AND c.user_id = $3
+     RETURNING e.event_id,
+               e.provider_event_id,
+               e.ical_uid,
+               e.event_name,
+               e.event_start,
+               e.event_end,
+               e.status,
+               e.blocking_level`,
+    [blockingLevel, eventId, userId]
+  );
+  return result.rows[0] || null;
+};
+
+const createUserBusyBlock = async ({ userId, title, startTime, endTime, blockingLevel }) => {
+  const result = await pool.query(
+    `INSERT INTO user_busy_block (user_id, title, start_time, end_time, blocking_level)
+     VALUES ($1, $2, $3, $4, $5)
+     RETURNING busy_block_id, user_id, title, start_time, end_time, blocking_level, created_at, updated_at`,
+    [userId, title ?? null, startTime, endTime, blockingLevel]
+  );
+  return result.rows[0];
+};
+
+const listUserBusyBlocks = async ({ userId, windowStartMs, windowEndMs }) => {
+  const start = new Date(windowStartMs);
+  const end = new Date(windowEndMs);
+  const result = await pool.query(
+    `SELECT busy_block_id, user_id, title, start_time, end_time, blocking_level, created_at, updated_at
+     FROM user_busy_block
+     WHERE user_id = $1
+       AND start_time < $3
+       AND end_time > $2
+     ORDER BY start_time, busy_block_id`,
+    [userId, start, end]
+  );
+  return result.rows;
+};
+
+const listUserBusyBlocksForUsers = async ({ userIds, windowStartMs, windowEndMs }) => {
+  if (!Array.isArray(userIds) || userIds.length === 0) {
+    return [];
+  }
+  const start = new Date(windowStartMs);
+  const end = new Date(windowEndMs);
+  const result = await pool.query(
+    `SELECT busy_block_id, user_id, title, start_time, end_time, blocking_level
+     FROM user_busy_block
+     WHERE user_id = ANY($1)
+       AND start_time < $3
+       AND end_time > $2
+     ORDER BY user_id, start_time, busy_block_id`,
+    [userIds, start, end]
+  );
+  return result.rows;
+};
+
+const updateUserBusyBlock = async ({
+  userId,
+  busyBlockId,
+  title,
+  startTime,
+  endTime,
+  blockingLevel
+}) => {
+  const result = await pool.query(
+    `UPDATE user_busy_block
+     SET title = COALESCE($3, title),
+         start_time = COALESCE($4, start_time),
+         end_time = COALESCE($5, end_time),
+         blocking_level = COALESCE($6, blocking_level),
+         updated_at = NOW()
+     WHERE busy_block_id = $2
+       AND user_id = $1
+     RETURNING busy_block_id, user_id, title, start_time, end_time, blocking_level, created_at, updated_at`,
+    [userId, busyBlockId, title ?? null, startTime ?? null, endTime ?? null, blockingLevel ?? null]
+  );
+  return result.rows[0] || null;
+};
+
+const deleteUserBusyBlock = async ({ userId, busyBlockId }) => {
+  const result = await pool.query(
+    `DELETE FROM user_busy_block
+     WHERE busy_block_id = $1
+       AND user_id = $2`,
+    [busyBlockId, userId]
+  );
+  return result.rowCount;
+};
+
+// Backwards-compatible wrapper (deprecated): insert Google events into cal_event.
 const addCalendarEvents = async (calendarId, events) => {
   if (!Array.isArray(events) || events.length === 0) {
     return 0;
   }
 
-  let inserted = 0;
-  for (const event of events) {
-    if (!event || !event.gcalEventId || !event.start || !event.end) {
-      continue;
-    }
-    const result = await pool.query(
-      `INSERT INTO cal_event (calendar_id, gcal_event_id, event_name, event_start, event_end, priority)
-       VALUES ($1, $2, $3, $4, $5, $6)
-       ON CONFLICT (calendar_id, gcal_event_id) DO NOTHING
-       RETURNING event_id`,
-      [
-        calendarId,
-        event.gcalEventId,
-        event.title || null,
-        event.start,
-        event.end,
-        Number.isInteger(event.priority) ? event.priority : 1
-      ]
-    );
-    if (result.rowCount > 0) {
-      inserted += 1;
-    }
-  }
+  const normalized = events
+    .map((event) => {
+      if (!event || !event.gcalEventId || !event.start || !event.end) return null;
+      return {
+        providerEventId: event.gcalEventId,
+        title: event.title ?? null,
+        start: event.start,
+        end: event.end,
+        status: 'confirmed'
+      };
+    })
+    .filter(Boolean);
 
-  return inserted;
+  const result = await upsertCalEvents(calendarId, normalized);
+  return result.inserted;
 };
 
 module.exports = {
@@ -434,5 +701,18 @@ module.exports = {
   getGroupMemberCount,
   getGroupMemberIds,
   upsertCalendarForUser,
+  getOrCreateCalendar,
+  getCalendarSyncState,
+  upsertCalendarSyncState,
+  upsertCalEvents,
+  markCalEventsCancelled,
+  listGoogleEventsForUser,
+  listGoogleEventsForUsers,
+  updateGoogleEventBlockingLevel,
+  createUserBusyBlock,
+  listUserBusyBlocks,
+  listUserBusyBlocksForUsers,
+  updateUserBusyBlock,
+  deleteUserBusyBlock,
   addCalendarEvents
 };

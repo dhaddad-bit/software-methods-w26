@@ -8,7 +8,7 @@ const session = require('express-session');
 const url = require('url');
 const pgSession = require('connect-pg-simple')(session);
 const { computeAvailabilityBlocks } = require('./algorithm/index.cjs');
-const { fetchBusyIntervalsForUser, listGoogleEvents } = require('./services/googleCalendar');
+const { syncGoogleEvents } = require('./services/googleCalendar');
 
 // .env config
 require('dotenv').config({
@@ -107,27 +107,226 @@ function parseTimeParam(value) {
   return parsed;
 }
 
+function toEpochMs(value) {
+  if (!value) return null;
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+  if (value instanceof Date) {
+    const ms = value.getTime();
+    return Number.isFinite(ms) ? ms : null;
+  }
+  const parsed = Date.parse(String(value));
+  return Number.isNaN(parsed) ? null : parsed;
+}
+
+function normalizeGoogleDateString(value) {
+  if (!value) return null;
+  if (typeof value !== 'string') return null;
+  if (value.match(/^\d{4}-\d{2}-\d{2}$/)) {
+    // Date-only events: treat as midnight UTC (MVP behavior).
+    return `${value}T00:00:00Z`;
+  }
+  return value;
+}
+
+const VALID_BLOCKING_LEVELS = new Set(['B1', 'B2', 'B3']);
+const VALID_AVAILABILITY_LEVELS = new Set(['AVAILABLE', 'FLEXIBLE', 'MAYBE']);
+
+function normalizeAvailabilityLevel(raw) {
+  const value = typeof raw === 'string' ? raw.trim().toUpperCase() : '';
+  if (VALID_AVAILABILITY_LEVELS.has(value)) return value;
+  return 'MAYBE';
+}
+
+function availabilityLevelToMinBlockingLevel(level) {
+  const normalized = normalizeAvailabilityLevel(level);
+  if (normalized === 'AVAILABLE') return 'B3';
+  if (normalized === 'FLEXIBLE') return 'B2';
+  return 'B1'; // MAYBE (strict)
+}
+
 const PETITION_GRANULARITY_MINUTES = 15;
 const PETITION_PRIORITY_DEFAULT = 'HIGHEST';
 
+const CALENDAR_SYNC_TTL_MS = 5 * 60 * 1000;
+
+async function syncCalendarForUser({ userId, refreshToken, gcalId = 'primary', force = false }) {
+  if (!refreshToken) {
+    const err = new Error('No refresh token for user');
+    err.code = 'NO_REFRESH_TOKEN';
+    throw err;
+  }
+
+  const calendarRecord = await db.getOrCreateCalendar({
+    userId,
+    gcalId,
+    calendarName: gcalId
+  });
+
+  const calendarDbId = calendarRecord?.calendar_id;
+  if (!calendarDbId) {
+    throw new Error('Failed to create calendar record');
+  }
+
+  const existingState = await db.getCalendarSyncState(calendarDbId);
+  const lastSyncedMs = toEpochMs(existingState?.last_synced_at);
+
+  if (
+    !force &&
+    process.env.NODE_ENV !== 'test' &&
+    Number.isFinite(lastSyncedMs) &&
+    Date.now() - lastSyncedMs < CALENDAR_SYNC_TTL_MS
+  ) {
+    return {
+      calendarDbId,
+      skipped: true,
+      inserted: 0,
+      updated: 0,
+      cancelled: 0,
+      fullSync: false,
+      syncTokenUpdated: false
+    };
+  }
+
+  const startingSyncToken = existingState?.sync_token || null;
+  let syncToken = startingSyncToken;
+
+  let syncResult;
+  try {
+    syncResult = await syncGoogleEvents({ refreshToken, calendarId: gcalId, syncToken });
+  } catch (error) {
+    if (error?.code === 'SYNC_TOKEN_EXPIRED') {
+      syncToken = null;
+      syncResult = await syncGoogleEvents({ refreshToken, calendarId: gcalId, syncToken: null });
+    } else {
+      throw error;
+    }
+  }
+
+  const items = Array.isArray(syncResult?.items) ? syncResult.items : [];
+  const cancelledProviderEventIds = [];
+  const eventsForDb = [];
+
+  for (const item of items) {
+    const providerEventId = item?.id;
+    if (!providerEventId) continue;
+
+    const status = typeof item.status === 'string' ? item.status : 'confirmed';
+    if (status === 'cancelled') {
+      cancelledProviderEventIds.push(providerEventId);
+      continue;
+    }
+
+    const start = normalizeGoogleDateString(item?.start?.dateTime || item?.start?.date);
+    const end = normalizeGoogleDateString(item?.end?.dateTime || item?.end?.date);
+    if (!start || !end) continue;
+
+    const originalStartTime = normalizeGoogleDateString(
+      item?.originalStartTime?.dateTime || item?.originalStartTime?.date
+    );
+
+    eventsForDb.push({
+      providerEventId,
+      iCalUID: item.iCalUID || null,
+      recurringEventId: item.recurringEventId || null,
+      originalStartTime: originalStartTime || null,
+      title: item.summary || null,
+      start,
+      end,
+      status,
+      providerUpdatedAt: item.updated || null,
+      etag: item.etag || null
+    });
+  }
+
+  const { inserted, updated } = await db.upsertCalEvents(calendarDbId, eventsForDb);
+  const cancelled = await db.markCalEventsCancelled(calendarDbId, cancelledProviderEventIds);
+
+  const now = new Date();
+  const nextSyncToken = syncResult?.nextSyncToken ?? syncToken ?? null;
+  const nextState = {
+    calendarId: calendarDbId,
+    syncToken: nextSyncToken,
+    lastSyncedAt: now,
+    lastFullSyncedAt: syncResult?.fullSync ? now : existingState?.last_full_synced_at || null,
+    lastError: null
+  };
+  await db.upsertCalendarSyncState(nextState);
+
+  return {
+    calendarDbId,
+    skipped: false,
+    inserted,
+    updated,
+    cancelled,
+    fullSync: Boolean(syncResult?.fullSync),
+    syncTokenUpdated: nextSyncToken !== startingSyncToken
+  };
+}
+
 async function buildParticipantsWithPetitions(groupId, windowStartMs, windowEndMs) {
   const members = await db.getGroupMembersWithTokens(groupId);
+  const memberIds = members.map((member) => member.id);
 
-  const participants = await Promise.all(
-    members.map(async (member) => {
-      const intervals = await fetchBusyIntervalsForUser({
-        userId: String(member.id),
-        refreshToken: member.google_refresh_token,
-        windowStartMs,
-        windowEndMs
-      });
-      return { userId: String(member.id), events: intervals };
-    })
+  if (process.env.NODE_ENV !== 'test') {
+    await Promise.all(
+      members.map((member) =>
+        syncCalendarForUser({
+          userId: member.id,
+          refreshToken: member.google_refresh_token,
+          gcalId: 'primary',
+          force: false
+        })
+      )
+    );
+  }
+
+  const participantsById = new Map(
+    memberIds.map((id) => [String(id), { userId: String(id), events: [] }])
   );
 
-  const participantsById = new Map(participants.map((p) => [p.userId, p]));
+  const [googleRows, busyRows] = await Promise.all([
+    db.listGoogleEventsForUsers({ userIds: memberIds, windowStartMs, windowEndMs }),
+    db.listUserBusyBlocksForUsers({ userIds: memberIds, windowStartMs, windowEndMs })
+  ]);
 
-  const memberIds = members.map((member) => member.id);
+  googleRows.forEach((row) => {
+    const userId = String(row.user_id);
+    const participant = participantsById.get(userId);
+    if (!participant) return;
+
+    const startMs = toEpochMs(row.event_start);
+    const endMs = toEpochMs(row.event_end);
+    if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) return;
+
+    participant.events.push({
+      eventRef: `google-${row.provider_event_id}`,
+      userId,
+      startMs,
+      endMs,
+      source: 'google',
+      blockingLevel: row.blocking_level
+    });
+  });
+
+  busyRows.forEach((row) => {
+    const userId = String(row.user_id);
+    const participant = participantsById.get(userId);
+    if (!participant) return;
+
+    const startMs = toEpochMs(row.start_time);
+    const endMs = toEpochMs(row.end_time);
+    if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) return;
+
+    participant.events.push({
+      eventRef: `busy-${row.busy_block_id}`,
+      userId,
+      startMs,
+      endMs,
+      source: 'manual',
+      blockingLevel: row.blocking_level
+    });
+  });
+
   const petitions = await db.listPetitionsForAvailability({
     userIds: memberIds,
     windowStartMs,
@@ -136,39 +335,44 @@ async function buildParticipantsWithPetitions(groupId, windowStartMs, windowEndM
 
   petitions.forEach((petition) => {
     if (petition.status === 'FAILED') return;
-    const startMs = Date.parse(petition.start_time);
-    const endMs = Date.parse(petition.end_time);
-    if (!Number.isFinite(startMs) || !Number.isFinite(endMs)) return;
+    const startMs = toEpochMs(petition.start_time);
+    const endMs = toEpochMs(petition.end_time);
+    if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) return;
 
-    const acceptedIds = Array.isArray(petition.accepted_user_ids)
-      ? petition.accepted_user_ids
-      : [];
+    const acceptedIds = Array.isArray(petition.accepted_user_ids) ? petition.accepted_user_ids : [];
 
-    acceptedIds.forEach((userId) => {
-      const participant = participantsById.get(String(userId));
+    acceptedIds.forEach((acceptedUserId) => {
+      const participant = participantsById.get(String(acceptedUserId));
       if (!participant) return;
-
       participant.events.push({
         eventRef: `petition-${petition.id}`,
-        userId: String(userId),
+        userId: String(acceptedUserId),
         startMs,
         endMs,
         source: 'petition',
-        blockingLevel: petition.priority || PETITION_PRIORITY_DEFAULT
+        blockingLevel: 'B3'
       });
     });
   });
 
-  return participants;
+  return [...participantsById.values()];
 }
 
-async function computeGroupAvailability({ groupId, windowStartMs, windowEndMs, granularityMinutes }) {
+async function computeGroupAvailability({
+  groupId,
+  windowStartMs,
+  windowEndMs,
+  granularityMinutes,
+  level
+}) {
   const participants = await buildParticipantsWithPetitions(groupId, windowStartMs, windowEndMs);
+  const minBlockingLevel = availabilityLevelToMinBlockingLevel(level);
   return computeAvailabilityBlocks({
     windowStartMs,
     windowEndMs,
     participants,
-    granularityMinutes
+    granularityMinutes,
+    priority: minBlockingLevel
   });
 }
 
@@ -336,6 +540,7 @@ app.post('/api/groups/:groupId/petitions', requireAuth, requireGroupMember, asyn
   const startMs = parseTimeParam(req.body?.start);
   const endMs = parseTimeParam(req.body?.end);
   const title = typeof req.body?.title === 'string' ? req.body.title.trim() : '';
+  const level = normalizeAvailabilityLevel(req.body?.level);
   let priority =
     typeof req.body?.priority === 'string' && req.body.priority.trim()
       ? req.body.priority.trim().toUpperCase()
@@ -361,7 +566,8 @@ app.post('/api/groups/:groupId/petitions', requireAuth, requireGroupMember, asyn
       groupId: req.groupId,
       windowStartMs: startMs,
       windowEndMs: endMs,
-      granularityMinutes: PETITION_GRANULARITY_MINUTES
+      granularityMinutes: PETITION_GRANULARITY_MINUTES,
+      level
     });
 
     const windowBlocks = blocks.filter(
@@ -509,6 +715,7 @@ app.get('/api/groups/:groupId/availability', requireAuth, requireGroupMember, as
   const windowStartMs = parseTimeParam(req.query.start);
   const windowEndMs = parseTimeParam(req.query.end);
   const granularityRaw = req.query.granularity;
+  const level = normalizeAvailabilityLevel(req.query.level);
 
   if (!Number.isFinite(windowStartMs) || !Number.isFinite(windowEndMs)) {
     return res.status(400).json({ error: 'start and end are required (ISO or epoch ms)' });
@@ -530,7 +737,8 @@ app.get('/api/groups/:groupId/availability', requireAuth, requireGroupMember, as
       groupId: req.groupId,
       windowStartMs,
       windowEndMs,
-      granularityMinutes: granularityMinutes || undefined
+      granularityMinutes: granularityMinutes || undefined,
+      level
     });
     return res.json(blocks);
   } catch (error) {
@@ -544,68 +752,296 @@ app.get('/api/groups/:groupId/availability', requireAuth, requireGroupMember, as
 
 // ===================CALENDAR EVENTS========================
 
-app.get('/api/events', requireAuth, async (req, res) => {
+app.post('/api/google/sync', requireAuth, async (req, res) => {
+  const calendarId =
+    typeof req.body?.calendarId === 'string' && req.body.calendarId.trim()
+      ? req.body.calendarId.trim()
+      : 'primary';
+  const force = Boolean(req.body?.force);
+
   try {
     const user = await db.getUserById(req.session.userId);
     if (!user || !user.google_refresh_token) {
       return res.status(401).json({ error: 'No tokens found. Please re-authenticate.' });
     }
 
-    const calendarStart = new Date();
-    calendarStart.setDate(calendarStart.getDate() - 14);
-
-    const events = await listGoogleEvents({
-      refreshToken: user.google_refresh_token,
-      timeMin: calendarStart
-    });
-
-    if (!events || events.length === 0) {
-      return res.json([]);
-    }
-
-    const formattedEvents = [];
-    const eventsForDb = [];
-
-    events.forEach((event) => {
-      const start = event?.start?.dateTime || event?.start?.date;
-      const end = event?.end?.dateTime || event?.end?.date;
-      if (!start || !end) {
-        return;
-      }
-
-      const title = event.summary || 'No Title';
-      formattedEvents.push({ title, start, end });
-
-      const gcalEventId = event.id || event.iCalUID;
-      if (gcalEventId) {
-        eventsForDb.push({ title, start, end, gcalEventId });
-      }
-    });
-
-    if (formattedEvents.length === 0) {
-      return res.json([]);
-    }
-
-    const calendarRecord = await db.upsertCalendarForUser({
+    const result = await syncCalendarForUser({
       userId: req.session.userId,
-      gcalId: 'primary',
-      calendarName: 'primary'
+      refreshToken: user.google_refresh_token,
+      gcalId: calendarId,
+      force
     });
 
-    if (calendarRecord?.calendar_id && eventsForDb.length > 0) {
-      await db.addCalendarEvents(calendarRecord.calendar_id, eventsForDb);
-    }
-
-    res.json(formattedEvents);
+    return res.json({
+      calendarId,
+      calendarDbId: result.calendarDbId,
+      fullSync: result.fullSync,
+      skipped: result.skipped,
+      syncedAt: new Date().toISOString(),
+      inserted: result.inserted,
+      updated: result.updated,
+      cancelled: result.cancelled,
+      syncTokenUpdated: result.syncTokenUpdated
+    });
   } catch (error) {
-    console.error('Error fetching calendar', error);
+    console.error('Error syncing Google calendar', error);
 
     if (error.code === 401 || error.code === 403) {
       req.session.destroy(() => {});
       return res.status(401).json({ error: 'Authentication expired. Please log in again.' });
     }
 
-    res.status(500).json({ error: 'Failed to fetch events' });
+    return res.status(500).json({ error: 'Failed to sync Google calendar' });
+  }
+});
+
+app.get('/api/events', requireAuth, async (req, res) => {
+  const startMs = parseTimeParam(req.query.start);
+  const endMs = parseTimeParam(req.query.end);
+
+  let windowStartMs = startMs;
+  let windowEndMs = endMs;
+
+  if (!Number.isFinite(windowStartMs) || !Number.isFinite(windowEndMs)) {
+    if (startMs === null && endMs === null) {
+      const now = Date.now();
+      windowEndMs = now;
+      windowStartMs = now - 14 * 24 * 60 * 60 * 1000;
+    } else {
+      return res.status(400).json({ error: 'start and end are required (ISO or epoch ms)' });
+    }
+  }
+
+  if (windowEndMs <= windowStartMs) {
+    return res.status(400).json({ error: 'end must be greater than start' });
+  }
+
+  try {
+    const rows = await db.listGoogleEventsForUser({
+      userId: req.session.userId,
+      windowStartMs,
+      windowEndMs
+    });
+
+    const out = rows.map((row) => ({
+      eventId: row.event_id,
+      providerEventId: row.provider_event_id,
+      iCalUID: row.ical_uid,
+      title: row.event_name || 'No Title',
+      start: row.event_start,
+      end: row.event_end,
+      status: row.status,
+      blockingLevel: row.blocking_level,
+      source: 'google'
+    }));
+
+    return res.json(out);
+  } catch (error) {
+    console.error('Error listing events', error);
+    return res.status(500).json({ error: 'Failed to fetch events' });
+  }
+});
+
+app.post('/api/events/:eventId/priority', requireAuth, async (req, res) => {
+  const eventId = Number.parseInt(req.params.eventId, 10);
+  if (!Number.isInteger(eventId)) {
+    return res.status(400).json({ error: 'Invalid eventId' });
+  }
+
+  const levelRaw = typeof req.body?.blockingLevel === 'string' ? req.body.blockingLevel : '';
+  const blockingLevel = levelRaw.trim().toUpperCase();
+  if (!VALID_BLOCKING_LEVELS.has(blockingLevel)) {
+    return res.status(400).json({ error: 'blockingLevel must be B1, B2, or B3' });
+  }
+
+  try {
+    const updated = await db.updateGoogleEventBlockingLevel({
+      userId: req.session.userId,
+      eventId,
+      blockingLevel
+    });
+
+    if (!updated) {
+      return res.status(404).json({ error: 'Event not found' });
+    }
+
+    return res.json({
+      eventId: updated.event_id,
+      providerEventId: updated.provider_event_id,
+      iCalUID: updated.ical_uid,
+      title: updated.event_name || 'No Title',
+      start: updated.event_start,
+      end: updated.event_end,
+      status: updated.status,
+      blockingLevel: updated.blocking_level,
+      source: 'google'
+    });
+  } catch (error) {
+    console.error('Error updating event priority', error);
+    return res.status(500).json({ error: 'Failed to update event priority' });
+  }
+});
+
+// ===================USER BUSY BLOCKS========================
+
+app.get('/api/busy-blocks', requireAuth, async (req, res) => {
+  const startMs = parseTimeParam(req.query.start);
+  const endMs = parseTimeParam(req.query.end);
+
+  let windowStartMs = startMs;
+  let windowEndMs = endMs;
+
+  if (!Number.isFinite(windowStartMs) || !Number.isFinite(windowEndMs)) {
+    if (startMs === null && endMs === null) {
+      const now = Date.now();
+      windowEndMs = now;
+      windowStartMs = now - 14 * 24 * 60 * 60 * 1000;
+    } else {
+      return res.status(400).json({ error: 'start and end are required (ISO or epoch ms)' });
+    }
+  }
+
+  if (windowEndMs <= windowStartMs) {
+    return res.status(400).json({ error: 'end must be greater than start' });
+  }
+
+  try {
+    const rows = await db.listUserBusyBlocks({
+      userId: req.session.userId,
+      windowStartMs,
+      windowEndMs
+    });
+
+    const out = rows.map((row) => ({
+      busyBlockId: row.busy_block_id,
+      title: row.title || 'Busy',
+      start: row.start_time,
+      end: row.end_time,
+      blockingLevel: row.blocking_level,
+      source: 'manual'
+    }));
+
+    return res.json(out);
+  } catch (error) {
+    console.error('Error listing busy blocks', error);
+    return res.status(500).json({ error: 'Failed to fetch busy blocks' });
+  }
+});
+
+app.post('/api/busy-blocks', requireAuth, async (req, res) => {
+  const startMs = parseTimeParam(req.body?.startMs);
+  const endMs = parseTimeParam(req.body?.endMs);
+  const title = typeof req.body?.title === 'string' ? req.body.title.trim() : '';
+
+  const levelRaw = typeof req.body?.blockingLevel === 'string' ? req.body.blockingLevel : 'B3';
+  const blockingLevel = levelRaw.trim().toUpperCase() || 'B3';
+  if (!VALID_BLOCKING_LEVELS.has(blockingLevel)) {
+    return res.status(400).json({ error: 'blockingLevel must be B1, B2, or B3' });
+  }
+
+  if (!Number.isFinite(startMs) || !Number.isFinite(endMs)) {
+    return res.status(400).json({ error: 'startMs and endMs are required (ISO or epoch ms)' });
+  }
+  if (endMs <= startMs) {
+    return res.status(400).json({ error: 'endMs must be greater than startMs' });
+  }
+
+  try {
+    const row = await db.createUserBusyBlock({
+      userId: req.session.userId,
+      title: title || null,
+      startTime: new Date(startMs),
+      endTime: new Date(endMs),
+      blockingLevel
+    });
+
+    return res.status(201).json({
+      busyBlockId: row.busy_block_id,
+      title: row.title || 'Busy',
+      start: row.start_time,
+      end: row.end_time,
+      blockingLevel: row.blocking_level,
+      source: 'manual'
+    });
+  } catch (error) {
+    console.error('Error creating busy block', error);
+    return res.status(500).json({ error: 'Failed to create busy block' });
+  }
+});
+
+app.post('/api/busy-blocks/:busyBlockId', requireAuth, async (req, res) => {
+  const busyBlockId = Number.parseInt(req.params.busyBlockId, 10);
+  if (!Number.isInteger(busyBlockId)) {
+    return res.status(400).json({ error: 'Invalid busyBlockId' });
+  }
+
+  const startMs = parseTimeParam(req.body?.startMs);
+  const endMs = parseTimeParam(req.body?.endMs);
+  const title = typeof req.body?.title === 'string' ? req.body.title.trim() : null;
+
+  let blockingLevel = null;
+  if (typeof req.body?.blockingLevel === 'string') {
+    const candidate = req.body.blockingLevel.trim().toUpperCase();
+    if (!VALID_BLOCKING_LEVELS.has(candidate)) {
+      return res.status(400).json({ error: 'blockingLevel must be B1, B2, or B3' });
+    }
+    blockingLevel = candidate;
+  }
+
+  if (startMs !== null && endMs !== null && Number.isFinite(startMs) && Number.isFinite(endMs)) {
+    if (endMs <= startMs) {
+      return res.status(400).json({ error: 'endMs must be greater than startMs' });
+    }
+  }
+
+  try {
+    const updated = await db.updateUserBusyBlock({
+      userId: req.session.userId,
+      busyBlockId,
+      title,
+      startTime: Number.isFinite(startMs) ? new Date(startMs) : null,
+      endTime: Number.isFinite(endMs) ? new Date(endMs) : null,
+      blockingLevel
+    });
+
+    if (!updated) {
+      return res.status(404).json({ error: 'Busy block not found' });
+    }
+
+    return res.json({
+      busyBlockId: updated.busy_block_id,
+      title: updated.title || 'Busy',
+      start: updated.start_time,
+      end: updated.end_time,
+      blockingLevel: updated.blocking_level,
+      source: 'manual'
+    });
+  } catch (error) {
+    console.error('Error updating busy block', error);
+    return res.status(500).json({ error: 'Failed to update busy block' });
+  }
+});
+
+app.delete('/api/busy-blocks/:busyBlockId', requireAuth, async (req, res) => {
+  const busyBlockId = Number.parseInt(req.params.busyBlockId, 10);
+  if (!Number.isInteger(busyBlockId)) {
+    return res.status(400).json({ error: 'Invalid busyBlockId' });
+  }
+
+  try {
+    const deleted = await db.deleteUserBusyBlock({
+      userId: req.session.userId,
+      busyBlockId
+    });
+
+    if (deleted === 0) {
+      return res.status(404).json({ error: 'Busy block not found' });
+    }
+
+    return res.json({ ok: true });
+  } catch (error) {
+    console.error('Error deleting busy block', error);
+    return res.status(500).json({ error: 'Failed to delete busy block' });
   }
 });
 

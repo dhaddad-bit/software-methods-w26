@@ -8,6 +8,11 @@ function createOAuthClient() {
   );
 }
 
+function isSyncTokenExpired(error) {
+  const status = error?.code || error?.response?.status || error?.status;
+  return status === 410;
+}
+
 function parseEventTime(eventTime) {
   if (!eventTime) return null;
   if (eventTime.dateTime) {
@@ -64,6 +69,59 @@ async function listGoogleEvents({ refreshToken, timeMin, timeMax }) {
   return response.data.items || [];
 }
 
+async function syncGoogleEvents({ refreshToken, calendarId = 'primary', syncToken = null }) {
+  const auth = createOAuthClient();
+  auth.setCredentials({ refresh_token: refreshToken });
+
+  const calendar = google.calendar({ version: 'v3', auth });
+
+  /** @type {any} */
+  const baseParams = {
+    calendarId,
+    maxResults: 2500,
+    singleEvents: true,
+    showDeleted: true
+  };
+
+  if (syncToken) {
+    baseParams.syncToken = syncToken;
+  }
+
+  const items = [];
+  let pageToken = undefined;
+  let nextSyncToken = null;
+
+  try {
+    do {
+      const response = await calendar.events.list({
+        ...baseParams,
+        pageToken
+      });
+
+      const pageItems = response.data.items || [];
+      items.push(...pageItems);
+
+      pageToken = response.data.nextPageToken || undefined;
+      if (!pageToken && response.data.nextSyncToken) {
+        nextSyncToken = response.data.nextSyncToken;
+      }
+    } while (pageToken);
+  } catch (error) {
+    if (isSyncTokenExpired(error)) {
+      const err = new Error('Google Calendar sync token expired');
+      err.code = 'SYNC_TOKEN_EXPIRED';
+      throw err;
+    }
+    throw error;
+  }
+
+  return {
+    items,
+    nextSyncToken,
+    fullSync: !syncToken
+  };
+}
+
 async function fetchBusyIntervalsForUser({ userId, refreshToken, windowStartMs, windowEndMs }) {
   if (!refreshToken) {
     const err = new Error('No refresh token for user');
@@ -82,6 +140,7 @@ async function fetchBusyIntervalsForUser({ userId, refreshToken, windowStartMs, 
 
 module.exports = {
   listGoogleEvents,
+  syncGoogleEvents,
   normalizeEventsToIntervals,
   fetchBusyIntervalsForUser
 };

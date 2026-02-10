@@ -13,8 +13,11 @@ function checkDbSafety() {
 
 async function runMigrations() {
   const sqlPath = path.join(__dirname, '..', 'db', 'table_initialization.sql');
-  const sql = fs.readFileSync(sqlPath, 'utf8');
-  const statements = sql
+  const migrationPath = path.join(__dirname, '..', 'db', 'priority_migrations.sql');
+  const sqlParts = [fs.readFileSync(sqlPath, 'utf8'), fs.readFileSync(migrationPath, 'utf8')];
+
+  const statements = sqlParts
+    .join('\n')
     .split(';')
     .map((s) => s.trim())
     .filter(Boolean);
@@ -22,11 +25,33 @@ async function runMigrations() {
   for (const stmt of statements) {
     await db.query(stmt);
   }
+
+  // Legacy upgrade: if cal_event.gcal_event_id exists, backfill provider_event_id and drop legacy columns.
+  const legacyColumnCheck = await db.query(
+    `SELECT 1
+     FROM information_schema.columns
+     WHERE table_name = 'cal_event'
+       AND column_name = 'gcal_event_id'
+     LIMIT 1`
+  );
+
+  if (legacyColumnCheck.rowCount > 0) {
+    await db.query(
+      `UPDATE cal_event
+       SET provider_event_id = gcal_event_id
+       WHERE provider_event_id IS NULL`
+    );
+    await db.query(`ALTER TABLE cal_event ALTER COLUMN provider_event_id SET NOT NULL`);
+    await db.query(`ALTER TABLE cal_event DROP COLUMN IF EXISTS gcal_event_id`);
+  } else {
+    // Ensure the final schema expectation holds for tests even if the DB was pre-migrated.
+    await db.query(`ALTER TABLE cal_event ALTER COLUMN provider_event_id SET NOT NULL`);
+  }
 }
 
 async function resetDb() {
   await db.query(
-    'TRUNCATE TABLE cal_event, calendar, petition_responses, petitions, group_memberships, groups, users RESTART IDENTITY CASCADE'
+    'TRUNCATE TABLE cal_event, calendar_sync_state, calendar, user_busy_block, petition_responses, petitions, group_memberships, groups, users RESTART IDENTITY CASCADE'
   );
 }
 

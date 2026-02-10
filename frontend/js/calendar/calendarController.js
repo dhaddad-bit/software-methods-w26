@@ -14,6 +14,25 @@ function getStartOfWeek(date) {
   return d;
 }
 
+function getWeekWindow(weekStart) {
+  const start = new Date(weekStart);
+  const end = new Date(weekStart);
+  end.setDate(end.getDate() + 7);
+  return { startMs: start.getTime(), endMs: end.getTime() };
+}
+
+function formatDateTimeLocal(msOrDate) {
+  const date = msOrDate instanceof Date ? msOrDate : new Date(msOrDate);
+  const local = new Date(date.getTime() - date.getTimezoneOffset() * 60000);
+  return local.toISOString().slice(0, 16);
+}
+
+function parseDateTimeLocal(value) {
+  if (!value) return null;
+  const ms = Date.parse(value);
+  return Number.isNaN(ms) ? null : ms;
+}
+
 async function ensureCurrentUser() {
   if (currentUserId) return;
   const me = await apiGet("/api/me");
@@ -85,6 +104,7 @@ export async function renderCalendar() {
   container.innerHTML = "";
 
   await ensureCurrentUser();
+  selectedPetition = null;
 
   const header = document.createElement("div");
   header.className = "calendar-header";
@@ -112,17 +132,186 @@ export async function renderCalendar() {
   header.append(prev, title, next);
   container.appendChild(header);
 
-  try {
-    // check permissions!
-      const events = await apiGet('/api/events');
+  const layout = document.createElement("div");
+  layout.className = "calendar-layout";
+  container.appendChild(layout);
 
-      console.log("Before renderCalendarGrid:", container.innerHTML);
-      renderCalendarGrid(container, currentWeekStart, events);
-  }
-  catch (error) {
-      console.error('Error fetching calendar', error);
-      container.innerHTML += "<p>No calendar loaded</p>";
-  }
+  const gridContainer = document.createElement("div");
+  gridContainer.className = "calendar-grid-wrapper";
+  layout.appendChild(gridContainer);
+
+  const panel = document.createElement("div");
+  panel.className = "event-panel";
+  layout.appendChild(panel);
+  panel.addEventListener("click", (evt) => evt.stopPropagation());
+
+  let selectedItem = null;
+  let selectedEl = null;
+
+  const panelTitle = document.createElement("h3");
+  panelTitle.textContent = "Event / Busy Block";
+
+  const panelMessage = document.createElement("div");
+  panelMessage.className = "event-panel-message";
+
+  const titleInput = document.createElement("input");
+  titleInput.type = "text";
+  titleInput.placeholder = "Title";
+  titleInput.className = "event-panel-input";
+
+  const startInput = document.createElement("input");
+  startInput.type = "datetime-local";
+  startInput.className = "event-panel-input";
+
+  const endInput = document.createElement("input");
+  endInput.type = "datetime-local";
+  endInput.className = "event-panel-input";
+
+  const levelSelect = document.createElement("select");
+  levelSelect.className = "event-panel-select";
+  ["B1", "B2", "B3"].forEach((level) => {
+    const option = document.createElement("option");
+    option.value = level;
+    option.textContent = level;
+    levelSelect.appendChild(option);
+  });
+  levelSelect.value = "B3";
+
+  const buttonRow = document.createElement("div");
+  buttonRow.className = "event-panel-buttons";
+
+  const newBtn = document.createElement("button");
+  newBtn.type = "button";
+  newBtn.textContent = "New Busy Block";
+
+  const createBtn = document.createElement("button");
+  createBtn.type = "button";
+  createBtn.textContent = "Create Busy Block";
+
+  const saveBtn = document.createElement("button");
+  saveBtn.type = "button";
+  saveBtn.textContent = "Save Changes";
+
+  const deleteBtn = document.createElement("button");
+  deleteBtn.type = "button";
+  deleteBtn.textContent = "Delete";
+
+  const savePriorityBtn = document.createElement("button");
+  savePriorityBtn.type = "button";
+  savePriorityBtn.textContent = "Save Priority";
+
+  buttonRow.append(newBtn, createBtn, saveBtn, savePriorityBtn, deleteBtn);
+
+  panel.appendChild(panelTitle);
+  panel.appendChild(panelMessage);
+  panel.appendChild(titleInput);
+  panel.appendChild(startInput);
+  panel.appendChild(endInput);
+  panel.appendChild(levelSelect);
+  panel.appendChild(buttonRow);
+
+  const setPanelMessage = (message, isError = false) => {
+    panelMessage.textContent = message || "";
+    panelMessage.dataset.type = isError ? "error" : "info";
+  };
+
+  const clearSelection = () => {
+    selectedItem = null;
+    if (selectedEl) selectedEl.classList.remove("selected");
+    selectedEl = null;
+    setPanelMessage("");
+    titleInput.disabled = false;
+    startInput.disabled = false;
+    endInput.disabled = false;
+    titleInput.value = "";
+    startInput.value = "";
+    endInput.value = "";
+    levelSelect.value = "B3";
+    createBtn.hidden = false;
+    saveBtn.hidden = true;
+    deleteBtn.hidden = true;
+    savePriorityBtn.hidden = true;
+  };
+
+  const setSelection = (item, el) => {
+    if (selectedEl) selectedEl.classList.remove("selected");
+    selectedItem = item;
+    selectedEl = el;
+    if (selectedEl) selectedEl.classList.add("selected");
+
+    setPanelMessage("");
+    titleInput.value = item.title || "";
+    startInput.value = formatDateTimeLocal(item.start);
+    endInput.value = formatDateTimeLocal(item.end);
+    levelSelect.value = item.blockingLevel || "B3";
+
+    if (item.source === "google") {
+      titleInput.disabled = true;
+      startInput.disabled = true;
+      endInput.disabled = true;
+      createBtn.hidden = true;
+      saveBtn.hidden = true;
+      deleteBtn.hidden = true;
+      savePriorityBtn.hidden = false;
+    } else {
+      titleInput.disabled = false;
+      startInput.disabled = false;
+      endInput.disabled = false;
+      createBtn.hidden = true;
+      saveBtn.hidden = false;
+      deleteBtn.hidden = false;
+      savePriorityBtn.hidden = true;
+    }
+  };
+
+  const loadCalendarData = async () => {
+    const week = getWeekWindow(currentWeekStart);
+    gridContainer.innerHTML = "";
+    clearSelection();
+
+    const syncRes = await apiPost("/api/google/sync", { calendarId: "primary", force: false });
+    if (syncRes && syncRes.error) {
+      setPanelMessage(syncRes.error, true);
+    }
+
+    const [googleEvents, busyBlocks] = await Promise.all([
+      apiGet(`/api/events?start=${week.startMs}&end=${week.endMs}`),
+      apiGet(`/api/busy-blocks?start=${week.startMs}&end=${week.endMs}`)
+    ]);
+
+    const combined = [];
+    if (Array.isArray(googleEvents)) {
+      combined.push(
+        ...googleEvents.map((event) => ({
+          id: event.eventId,
+          title: event.title,
+          start: event.start,
+          end: event.end,
+          blockingLevel: event.blockingLevel,
+          providerEventId: event.providerEventId,
+          source: "google"
+        }))
+      );
+    }
+    if (Array.isArray(busyBlocks)) {
+      combined.push(
+        ...busyBlocks.map((block) => ({
+          id: block.busyBlockId,
+          title: block.title,
+          start: block.start,
+          end: block.end,
+          blockingLevel: block.blockingLevel,
+          source: "manual"
+        }))
+      );
+    }
+
+    renderCalendarGrid(gridContainer, currentWeekStart, combined, {
+      onEventClick: (item, el) => setSelection(item, el)
+    });
+
+    await loadPetitions();
+  };
 
   const actionBar = buildActionBar(container, async (action) => {
     if (!selectedPetition) return;
@@ -140,9 +329,10 @@ export async function renderCalendar() {
     }
   });
 
-  container.onclick = () => {
+  gridContainer.onclick = () => {
     selectedPetition = null;
     actionBar.update();
+    clearSelection();
   };
 
   async function loadPetitions() {
@@ -150,7 +340,7 @@ export async function renderCalendar() {
     petitionsCache = Array.isArray(petitions) ? petitions : [];
     selectedPetition = null;
     renderPetitions({
-      root: container,
+      root: gridContainer,
       petitions: petitionsCache,
       onSelect: (petition) => {
         selectedPetition = petition;
@@ -160,5 +350,98 @@ export async function renderCalendar() {
     actionBar.update();
   }
 
-  await loadPetitions();
+  newBtn.onclick = () => {
+    clearSelection();
+    setPanelMessage("Create a new busy block (manual).");
+  };
+
+  createBtn.onclick = async () => {
+    const startMs = parseDateTimeLocal(startInput.value);
+    const endMs = parseDateTimeLocal(endInput.value);
+
+    if (!Number.isFinite(startMs) || !Number.isFinite(endMs)) {
+      setPanelMessage("Enter valid start and end times.", true);
+      return;
+    }
+    if (endMs <= startMs) {
+      setPanelMessage("End time must be after start time.", true);
+      return;
+    }
+
+    const res = await apiPost("/api/busy-blocks", {
+      title: titleInput.value.trim() || "Busy",
+      startMs,
+      endMs,
+      blockingLevel: levelSelect.value
+    });
+
+    if (res && res.error) {
+      setPanelMessage(res.error, true);
+      return;
+    }
+
+    await loadCalendarData();
+    setPanelMessage("Busy block created.");
+  };
+
+  saveBtn.onclick = async () => {
+    if (!selectedItem || selectedItem.source !== "manual") return;
+    const startMs = parseDateTimeLocal(startInput.value);
+    const endMs = parseDateTimeLocal(endInput.value);
+    if (!Number.isFinite(startMs) || !Number.isFinite(endMs)) {
+      setPanelMessage("Enter valid start and end times.", true);
+      return;
+    }
+    if (endMs <= startMs) {
+      setPanelMessage("End time must be after start time.", true);
+      return;
+    }
+
+    const res = await apiPost(`/api/busy-blocks/${selectedItem.id}`, {
+      title: titleInput.value.trim() || "Busy",
+      startMs,
+      endMs,
+      blockingLevel: levelSelect.value
+    });
+
+    if (res && res.error) {
+      setPanelMessage(res.error, true);
+      return;
+    }
+
+    await loadCalendarData();
+    setPanelMessage("Busy block updated.");
+  };
+
+  deleteBtn.onclick = async () => {
+    if (!selectedItem || selectedItem.source !== "manual") return;
+
+    const res = await apiDelete(`/api/busy-blocks/${selectedItem.id}`);
+    if (res && res.error) {
+      setPanelMessage(res.error, true);
+      return;
+    }
+
+    await loadCalendarData();
+    setPanelMessage("Busy block deleted.");
+  };
+
+  savePriorityBtn.onclick = async () => {
+    if (!selectedItem || selectedItem.source !== "google") return;
+
+    const res = await apiPost(`/api/events/${selectedItem.id}/priority`, {
+      blockingLevel: levelSelect.value
+    });
+
+    if (res && res.error) {
+      setPanelMessage(res.error, true);
+      return;
+    }
+
+    await loadCalendarData();
+    setPanelMessage("Priority updated.");
+  };
+
+  clearSelection();
+  await loadCalendarData();
 }

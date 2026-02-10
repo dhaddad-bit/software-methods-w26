@@ -204,3 +204,112 @@ button:hover {
   gap: 8px;
   justify-content: center;
 }
+
+.calendar-layout {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+}
+
+.calendar-grid-wrapper {
+  flex: 1;
+  min-width: 0;
+}
+
+.event-panel {
+  width: 320px;
+  padding: 10px;
+  border: 1px solid #e0e0e0;
+  border-radius: 6px;
+  background: #fafafa;
+  position: sticky;
+  top: 10px;
+}
+
+.event-panel-message {
+  min-height: 18px;
+  margin: 6px 0 10px;
+  font-size: 13px;
+  color: #2c3e50;
+}
+
+.event-panel-message[data-type="error"] {
+  color: #c0392b;
+}
+
+.event-panel-input,
+.event-panel-select {
+  width: 100%;
+  padding: 8px 10px;
+  font-size: 14px;
+  margin: 4px 0;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+  font-family: 'Courier New', Courier, monospace;
+  box-sizing: border-box;
+}
+
+.event-panel-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: center;
+  margin-top: 10px;
+}
+
+.event-panel button {
+  font-size: 14px;
+  padding: 6px 10px;
+}
+
+.availability-level-row {
+  display: flex;
+  gap: 8px;
+  justify-content: center;
+  align-items: center;
+  margin-top: 8px;
+  flex-wrap: wrap;
+}
+
+.availability-level-select {
+  padding: 6px 10px;
+  font-size: 14px;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+  font-family: 'Courier New', Courier, monospace;
+}
+
+@media (max-width: 768px) {
+  .calendar-layout {
+    flex-direction: column;
+  }
+
+  .event-panel {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    top: auto;
+    width: auto;
+    max-height: 45vh;
+    overflow: auto;
+    border-radius: 12px 12px 0 0;
+    z-index: 50;
+  }
+
+  .petition-panel {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    max-height: 45vh;
+    overflow: auto;
+    border-radius: 12px 12px 0 0;
+    z-index: 40;
+  }
+
+  #calendar,
+  #groups {
+    padding-bottom: 50vh;
+  }
+}

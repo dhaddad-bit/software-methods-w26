@@ -10,6 +10,7 @@ let currentWeekStart = getStartOfWeek(new Date());
 let selectedGroupId = null;
 let currentUserId = null;
 let windowPointerUpHandler = null;
+let availabilityLevel = "MAYBE";
 
 function getStartOfWeek(date) {
   const d = new Date(date);
@@ -82,7 +83,8 @@ async function fetchGroupAvailability(groupId, weekStart) {
   const query = new URLSearchParams({
     start: String(startMs),
     end: String(endMs),
-    granularity: String(GRANULARITY_MINUTES)
+    granularity: String(GRANULARITY_MINUTES),
+    level: availabilityLevel
   });
 
   const blocks = await apiGet(`/api/groups/${groupId}/availability?${query.toString()}`);
@@ -199,10 +201,36 @@ export async function renderGroups() {
 
   const detailSubtitle = document.createElement("p");
   detailSubtitle.className = "group-detail-subtitle";
-  detailSubtitle.textContent = "Darker green = more members available. Select only darkest blocks.";
+  detailSubtitle.textContent =
+    "Darker green = more members available. Availability filter: Count all conflicts (B1+B2+B3).";
+
+  const levelRow = document.createElement("div");
+  levelRow.className = "availability-level-row";
+
+  const levelLabel = document.createElement("span");
+  levelLabel.className = "availability-level-label";
+  levelLabel.textContent = "Availability:";
+
+  const levelSelect = document.createElement("select");
+  levelSelect.className = "availability-level-select";
+  [
+    { value: "AVAILABLE", label: "AVAILABLE (ignore B1+B2)" },
+    { value: "FLEXIBLE", label: "FLEXIBLE (ignore B1)" },
+    { value: "MAYBE", label: "MAYBE (count all)" }
+  ].forEach((opt) => {
+    const option = document.createElement("option");
+    option.value = opt.value;
+    option.textContent = opt.label;
+    levelSelect.appendChild(option);
+  });
+  levelSelect.value = availabilityLevel;
+
+  levelRow.appendChild(levelLabel);
+  levelRow.appendChild(levelSelect);
 
   detailHeader.appendChild(detailTitle);
   detailHeader.appendChild(detailSubtitle);
+  detailHeader.appendChild(levelRow);
 
   const detailStatus = document.createElement("div");
   detailStatus.className = "group-status";
@@ -299,6 +327,27 @@ export async function renderGroups() {
     let tapAnchorMs = null;
     let didDragSelect = false;
     let petitionsCache = [];
+
+    const updateSubtitleForLevel = () => {
+      if (availabilityLevel === "AVAILABLE") {
+        detailSubtitle.textContent =
+          "Darker green = more members available. Availability filter: Ignore B1+B2 conflicts.";
+      } else if (availabilityLevel === "FLEXIBLE") {
+        detailSubtitle.textContent =
+          "Darker green = more members available. Availability filter: Ignore B1 conflicts.";
+      } else {
+        detailSubtitle.textContent =
+          "Darker green = more members available. Availability filter: Count all conflicts (B1+B2+B3).";
+      }
+      levelSelect.value = availabilityLevel;
+    };
+
+    updateSubtitleForLevel();
+    levelSelect.onchange = async () => {
+      availabilityLevel = levelSelect.value;
+      updateSubtitleForLevel();
+      await refreshData();
+    };
 
     const header = document.createElement("div");
     header.className = "calendar-header";
@@ -645,7 +694,8 @@ export async function renderGroups() {
           title: titleInput.value.trim() || "Petitioned Meeting",
           start: selection.startMs,
           end: selection.endMs,
-          priority: prioritySelect.value
+          priority: prioritySelect.value,
+          level: availabilityLevel
         };
         await createPetition(group.id, payload);
         titleInput.value = "";
