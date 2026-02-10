@@ -143,6 +143,77 @@ button:hover {
   margin-top: 10px;
 }
 
+.group-textarea {
+  min-height: 70px;
+  resize: vertical;
+  line-height: 1.4;
+}
+
+.group-members {
+  max-width: 640px;
+  margin: 12px auto 0;
+  padding: 10px;
+  border: 1px solid #e0e0e0;
+  border-radius: 6px;
+  background: #fafafa;
+  text-align: left;
+}
+
+.group-members-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.group-members-header h4 {
+  margin: 0;
+  font-size: 16px;
+}
+
+.group-members-count {
+  color: #555;
+  font-size: 14px;
+}
+
+.group-members-list {
+  margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.group-member-row {
+  padding: 4px 6px;
+  border-radius: 4px;
+  background: rgba(0, 0, 0, 0.03);
+  font-size: 14px;
+}
+
+.group-members-add {
+  margin-top: 10px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: flex-start;
+}
+
+.group-members-add button {
+  font-size: 16px;
+  padding: 6px 12px;
+}
+
+.group-members-help {
+  margin-top: 6px;
+  font-size: 12px;
+  color: #555;
+}
+
+.group-members-message {
+  margin-top: 6px;
+  text-align: left;
+}
+
 .petition-message {
   text-align: center;
   min-height: 20px;

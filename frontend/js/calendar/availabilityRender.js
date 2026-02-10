@@ -49,7 +49,7 @@ export function renderAvailability(options = {}) {
 
     normalizedSlots.forEach((slot) => {
       const fraction = slot.availabilityFraction;
-      if (typeof fraction === "number" && fraction <= minFraction) return;
+      if (typeof fraction === "number" && fraction < minFraction) return;
 
       const overlapStartMs = Math.max(slot.start.getTime(), cellStart.getTime());
       const overlapEndMs = Math.min(slot.end.getTime(), cellEnd.getTime());
@@ -64,8 +64,12 @@ export function renderAvailability(options = {}) {
       overlay.style.height = `${height}px`;
 
       if (typeof fraction === "number") {
-        const alpha = Math.min(0.85, 0.15 + 0.7 * fraction);
-        overlay.style.backgroundColor = `rgba(76, 175, 80, ${alpha})`;
+        if (fraction === 0) {
+          overlay.classList.add("unavailable");
+        } else {
+          const alpha = Math.min(0.85, 0.15 + 0.7 * fraction);
+          overlay.style.backgroundColor = `rgba(76, 175, 80, ${alpha})`;
+        }
       } else {
         overlay.style.top = "0";
         overlay.style.height = "100%";

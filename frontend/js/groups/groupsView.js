@@ -64,18 +64,76 @@ async function fetchGroups() {
   return groups;
 }
 
-async function createGroupWithMember(groupName, email) {
+async function createGroup(groupName) {
   const group = await apiPost("/api/groups", { name: groupName });
   if (group && group.error) {
     throw new Error(group.error);
   }
+  return group;
+}
 
-  const addMember = await apiPost(`/api/groups/${group.id}/members`, { email });
-  if (addMember && addMember.error) {
-    return { group, memberAdded: false, error: addMember.error };
+async function fetchGroupMembers(groupId) {
+  const members = await apiGet(`/api/groups/${groupId}/members`);
+  if (members && members.error) {
+    throw new Error(members.error);
+  }
+  if (!Array.isArray(members)) {
+    throw new Error("Unexpected members response");
+  }
+  return members;
+}
+
+function parseEmails(rawString) {
+  const raw = typeof rawString === "string" ? rawString : "";
+  const parts = raw.split(/[\s,;]+/);
+  const seen = new Set();
+  const out = [];
+
+  parts.forEach((part) => {
+    const email = part.trim();
+    if (!email) return;
+    const key = email.toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push(email);
+  });
+
+  return out;
+}
+
+function normalizeAddMemberError(message) {
+  const raw = typeof message === "string" ? message : "";
+  if (!raw) return "Failed to add member";
+  if (raw.toLowerCase().includes("must log in first")) return "User must log in first";
+  return raw;
+}
+
+async function addMembersToGroup(groupId, emails, options = {}) {
+  const list = Array.isArray(emails) ? emails : [];
+  const added = [];
+  const failed = [];
+  const onProgress = typeof options.onProgress === "function" ? options.onProgress : null;
+
+  for (let i = 0; i < list.length; i++) {
+    const email = list[i];
+    if (onProgress) onProgress({ current: i, total: list.length, email });
+
+    let result;
+    try {
+      result = await apiPost(`/api/groups/${groupId}/members`, { email });
+    } catch (error) {
+      failed.push({ email, error: error?.message || "Failed to add member" });
+      continue;
+    }
+    if (result && result.error) {
+      failed.push({ email, error: result.error });
+    } else {
+      added.push(email);
+    }
   }
 
-  return { group, memberAdded: true };
+  if (onProgress) onProgress({ current: list.length, total: list.length, email: null });
+  return { added, failed };
 }
 
 async function fetchGroupAvailability(groupId, weekStart) {
@@ -163,13 +221,14 @@ export async function renderGroups() {
 
   const nameInput = document.createElement("input");
   nameInput.type = "text";
-  nameInput.placeholder = "Group name (optional)";
+  nameInput.placeholder = "Group name (required)";
   nameInput.className = "group-input";
 
-  const emailInput = document.createElement("input");
-  emailInput.type = "email";
-  emailInput.placeholder = "Invite Gmail (required)";
-  emailInput.className = "group-input";
+  const membersInput = document.createElement("textarea");
+  membersInput.placeholder =
+    "Member emails (optional). One per line or comma-separated.\nMembers must have logged in once.";
+  membersInput.className = "group-input group-textarea";
+  membersInput.rows = 3;
 
   const createBtn = document.createElement("button");
   createBtn.type = "submit";
@@ -177,7 +236,7 @@ export async function renderGroups() {
   createBtn.textContent = "Create Group";
 
   form.appendChild(nameInput);
-  form.appendChild(emailInput);
+  form.appendChild(membersInput);
   form.appendChild(createBtn);
 
   const message = document.createElement("div");
@@ -202,7 +261,7 @@ export async function renderGroups() {
   const detailSubtitle = document.createElement("p");
   detailSubtitle.className = "group-detail-subtitle";
   detailSubtitle.textContent =
-    "Darker green = more members available. Conflicts counted: B1 (low) + B2 (med) + B3 (high).";
+    "Gray hatch = 0 members available. Darker green = more members available. Conflicts counted: B1 (low) + B2 (med) + B3 (high).";
 
   const levelRow = document.createElement("div");
   levelRow.className = "availability-level-row";
@@ -231,6 +290,55 @@ export async function renderGroups() {
   detailHeader.appendChild(detailTitle);
   detailHeader.appendChild(detailSubtitle);
   detailHeader.appendChild(levelRow);
+
+  const membersSection = document.createElement("div");
+  membersSection.className = "group-members";
+
+  const membersHeader = document.createElement("div");
+  membersHeader.className = "group-members-header";
+
+  const membersTitle = document.createElement("h4");
+  membersTitle.textContent = "Members";
+
+  const membersCount = document.createElement("span");
+  membersCount.className = "group-members-count";
+  membersCount.textContent = "";
+
+  membersHeader.appendChild(membersTitle);
+  membersHeader.appendChild(membersCount);
+
+  const membersList = document.createElement("div");
+  membersList.className = "group-members-list";
+
+  const membersMessage = document.createElement("div");
+  membersMessage.className = "group-message group-members-message";
+
+  const addMembersRow = document.createElement("div");
+  addMembersRow.className = "group-members-add";
+
+  const addMembersInput = document.createElement("textarea");
+  addMembersInput.className = "group-input group-textarea";
+  addMembersInput.placeholder = "Add member emails (one per line or comma-separated)";
+  addMembersInput.rows = 2;
+
+  const addMembersBtn = document.createElement("button");
+  addMembersBtn.type = "button";
+  addMembersBtn.textContent = "Add Members";
+
+  addMembersRow.appendChild(addMembersInput);
+  addMembersRow.appendChild(addMembersBtn);
+
+  const membersHelp = document.createElement("div");
+  membersHelp.className = "group-members-help";
+  membersHelp.textContent = "Members must have logged in once.";
+
+  membersSection.appendChild(membersHeader);
+  membersSection.appendChild(membersList);
+  membersSection.appendChild(membersMessage);
+  membersSection.appendChild(addMembersRow);
+  membersSection.appendChild(membersHelp);
+
+  detailHeader.appendChild(membersSection);
 
   const detailStatus = document.createElement("div");
   detailStatus.className = "group-status";
@@ -309,11 +417,16 @@ export async function renderGroups() {
   container.appendChild(list);
   container.appendChild(detail);
 
-  const renderGroupCalendar = async (group) => {
-    selectedGroupId = group.id;
-    detail.hidden = false;
-    detailTitle.textContent = group.name;
-    petitionMessage.textContent = "";
+	  const renderGroupCalendar = async (group) => {
+	    selectedGroupId = group.id;
+	    const renderGroupId = String(group.id);
+	    detail.hidden = false;
+	    detailTitle.textContent = group.name;
+	    petitionMessage.textContent = "";
+	    addMembersInput.value = "";
+	    setMessage(membersMessage, "");
+	    membersList.innerHTML = "";
+	    membersCount.textContent = "";
 
     calendarWrapper.innerHTML = "";
     petitionActions.innerHTML = "";
@@ -328,19 +441,19 @@ export async function renderGroups() {
     let didDragSelect = false;
     let petitionsCache = [];
 
-    const updateSubtitleForLevel = () => {
-      if (availabilityLevel === "AVAILABLE") {
-        detailSubtitle.textContent =
-          "Darker green = more members available. Conflicts counted: B3 (high) only.";
-      } else if (availabilityLevel === "FLEXIBLE") {
-        detailSubtitle.textContent =
-          "Darker green = more members available. Conflicts counted: B2 (med) + B3 (high).";
-      } else {
-        detailSubtitle.textContent =
-          "Darker green = more members available. Conflicts counted: B1 (low) + B2 (med) + B3 (high).";
-      }
-      levelSelect.value = availabilityLevel;
-    };
+	    const updateSubtitleForLevel = () => {
+	      if (availabilityLevel === "AVAILABLE") {
+	        detailSubtitle.textContent =
+	          "Gray hatch = 0 members available. Darker green = more members available. Conflicts counted: B3 (high) only.";
+	      } else if (availabilityLevel === "FLEXIBLE") {
+	        detailSubtitle.textContent =
+	          "Gray hatch = 0 members available. Darker green = more members available. Conflicts counted: B2 (med) + B3 (high).";
+	      } else {
+	        detailSubtitle.textContent =
+	          "Gray hatch = 0 members available. Darker green = more members available. Conflicts counted: B1 (low) + B2 (med) + B3 (high).";
+	      }
+	      levelSelect.value = availabilityLevel;
+	    };
 
     updateSubtitleForLevel();
     levelSelect.onchange = async () => {
@@ -610,40 +723,119 @@ export async function renderGroups() {
       petitionActions.appendChild(actions);
     };
 
-    const refreshData = async () => {
-      clearSelection();
-      setMessage(detailStatus, "Loading availability...");
-      try {
-        const [blocks, petitions] = await Promise.all([
-          fetchGroupAvailability(group.id, currentWeekStart),
-          fetchGroupPetitions(group.id)
-        ]);
+		    const refreshData = async () => {
+		      clearSelection();
+		      setMessage(detailStatus, "Loading availability...");
+		      try {
+	        const [blocks, petitions] = await Promise.all([
+	          fetchGroupAvailability(group.id, currentWeekStart),
+	          fetchGroupPetitions(group.id)
+	        ]);
+	        if (String(selectedGroupId) !== renderGroupId) return;
 
-        petitionsCache = petitions;
+	        petitionsCache = petitions;
 
-        renderAvailability({
-          root: gridContainer,
+	        renderAvailability({
+	          root: gridContainer,
           slots: blocks,
           minFraction: 0,
           interactive: true
         });
 
-        renderPetitions({
-          root: gridContainer,
-          petitions: petitionsCache,
-          onSelect: (petition) => {
-            clearSelection();
-            updatePetitionActions(petition);
-          }
-        });
+	        renderPetitions({
+	          root: gridContainer,
+	          petitions: petitionsCache,
+	          onSelect: (petition) => {
+	            clearSelection();
+	            updatePetitionActions(petition);
+	          }
+	        });
 
-        setupSelectionHandlers();
-        updatePetitionActions(null);
-        setMessage(detailStatus, "");
-      } catch (error) {
-        setMessage(detailStatus, error.message || "Failed to load availability", true);
-      }
-    };
+	        setupSelectionHandlers();
+	        updatePetitionActions(null);
+		        setMessage(detailStatus, "");
+	      } catch (error) {
+	        if (String(selectedGroupId) !== renderGroupId) return;
+		        setMessage(detailStatus, error.message || "Failed to load availability", true);
+		      }
+		    };
+
+	    const renderMembers = (members) => {
+	      membersList.innerHTML = "";
+	      membersCount.textContent = `(${members.length})`;
+	      if (members.length === 0) {
+	        membersList.innerHTML = "<p>No members found.</p>";
+	        return;
+	      }
+
+	      members.forEach((member) => {
+	        const row = document.createElement("div");
+	        row.className = "group-member-row";
+
+	        const label = member.name ? `${member.name} <${member.email}>` : member.email;
+	        row.textContent =
+	          String(member.id) === String(currentUserId) ? `${label} (you)` : label;
+	        membersList.appendChild(row);
+	      });
+	    };
+
+		    const refreshMembers = async () => {
+		      setMessage(membersMessage, "Loading members...");
+		      try {
+		        const members = await fetchGroupMembers(group.id);
+		        if (String(selectedGroupId) !== renderGroupId) return [];
+		        renderMembers(members);
+		        setMessage(membersMessage, "");
+		        return members;
+		      } catch (error) {
+		        if (String(selectedGroupId) !== renderGroupId) return [];
+		        membersList.innerHTML = "";
+		        membersCount.textContent = "";
+		        setMessage(membersMessage, error.message || "Failed to load members", true);
+		        return [];
+		      }
+		    };
+
+		    addMembersBtn.onclick = async () => {
+		      const emails = parseEmails(addMembersInput.value);
+		      if (emails.length === 0) {
+		        setMessage(membersMessage, "Enter one or more email addresses.", true);
+		        return;
+		      }
+
+		      addMembersBtn.disabled = true;
+		      setMessage(membersMessage, `Adding members (0/${emails.length})...`);
+
+		      try {
+		        const result = await addMembersToGroup(group.id, emails, {
+		          onProgress: ({ current, total }) => {
+		            if (String(selectedGroupId) !== renderGroupId) return;
+		            setMessage(membersMessage, `Adding members (${current}/${total})...`);
+		          }
+		        });
+		        if (String(selectedGroupId) !== renderGroupId) return;
+
+		        const addedCount = result.added.length;
+		        let summary = `Added ${addedCount}/${emails.length} members.`;
+
+	        if (result.failed.length > 0) {
+	          const failedList = result.failed
+	            .map((item) => `${item.email} (${normalizeAddMemberError(item.error)})`)
+	            .join(", ");
+	          summary += ` Couldn’t add: ${failedList}`;
+	        }
+
+	        setMessage(membersMessage, summary, result.failed.length > 0);
+	        addMembersInput.value = "";
+
+	        await refreshMembers();
+	        await refreshData();
+	      } catch (error) {
+	        setMessage(membersMessage, error.message || "Failed to add members", true);
+	      } finally {
+	        addMembersBtn.disabled = false;
+	      }
+	    };
 
     applyRangeBtn.onclick = () => {
       const startMs = parseDateTimeLocal(startInput.value);
@@ -718,12 +910,12 @@ export async function renderGroups() {
       updatePetitionActions(null);
     });
 
-    await refreshData();
-  };
+	    await Promise.all([refreshMembers(), refreshData()]);
+	  };
 
-  const loadGroups = async () => {
+  const loadGroups = async ({ preserveMessage = false } = {}) => {
     list.innerHTML = "";
-    setMessage(message, "");
+    if (!preserveMessage) setMessage(message, "");
 
     try {
       const groups = await fetchGroups();
@@ -750,44 +942,58 @@ export async function renderGroups() {
     }
   };
 
-  form.addEventListener("submit", async (event) => {
-    event.preventDefault();
-    const email = emailInput.value.trim();
-    const nameValue = nameInput.value.trim();
+	  form.addEventListener("submit", async (event) => {
+	    event.preventDefault();
+	    const nameValue = nameInput.value.trim();
+	    const emails = parseEmails(membersInput.value);
 
-    if (!email) {
-      setMessage(message, "Please enter a Gmail address.", true);
-      return;
-    }
+	    if (!nameValue) {
+	      setMessage(message, "Group name is required.", true);
+	      return;
+	    }
 
-    const groupName = nameValue || `Group with ${email}`;
+	    createBtn.disabled = true;
+	    setMessage(message, "Creating group...");
 
-    createBtn.disabled = true;
-    setMessage(message, "Creating group...");
+	    try {
+	      const group = await createGroup(nameValue);
 
-    try {
-      const result = await createGroupWithMember(groupName, email);
-      if (!result.memberAdded && result.error) {
-        setMessage(message, result.error, true);
-      } else {
-        setMessage(message, "Group created!", false);
-      }
+	      let addResult = { added: [], failed: [] };
+	      if (emails.length > 0) {
+	        setMessage(message, `Adding members (0/${emails.length})...`);
+	        addResult = await addMembersToGroup(group.id, emails, {
+	          onProgress: ({ current, total }) => {
+	            setMessage(message, `Adding members (${current}/${total})...`);
+	          }
+	        });
+	      }
 
-      nameInput.value = "";
-      emailInput.value = "";
+	      if (emails.length === 0) {
+	        setMessage(message, "Group created.", false);
+	      } else {
+	        let summary = `Group created. Added ${addResult.added.length}/${emails.length} members.`;
+	        if (addResult.failed.length > 0) {
+	          const failedList = addResult.failed
+	            .map((item) => `${item.email} (${normalizeAddMemberError(item.error)})`)
+	            .join(", ");
+	          summary += ` Couldn’t add: ${failedList}`;
+	        }
+	        setMessage(message, summary, addResult.failed.length > 0);
+	      }
 
-      currentWeekStart = getStartOfWeek(new Date());
-      await loadGroups();
+	      nameInput.value = "";
+	      membersInput.value = "";
 
-      if (result.group) {
-        await renderGroupCalendar(result.group);
-      }
-    } catch (error) {
-      setMessage(message, error.message || "Failed to create group", true);
-    } finally {
-      createBtn.disabled = false;
-    }
-  });
+	      currentWeekStart = getStartOfWeek(new Date());
+	      await loadGroups({ preserveMessage: true });
+
+	      await renderGroupCalendar(group);
+	    } catch (error) {
+	      setMessage(message, error.message || "Failed to create group", true);
+	    } finally {
+	      createBtn.disabled = false;
+	    }
+	  });
 
   await loadGroups();
 }
