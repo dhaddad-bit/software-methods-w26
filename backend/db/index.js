@@ -364,6 +364,50 @@ const getGroupMemberIds = async (groupId) => {
   return result.rows.map((row) => row.user_id);
 };
 
+const upsertCalendarForUser = async ({ userId, gcalId = 'primary', calendarName = null }) => {
+  const result = await pool.query(
+    `INSERT INTO calendar (user_id, gcal_id, calendar_name)
+     VALUES ($1, $2, $3)
+     ON CONFLICT (user_id, gcal_id)
+     DO UPDATE SET calendar_name = COALESCE(EXCLUDED.calendar_name, calendar.calendar_name)
+     RETURNING calendar_id`,
+    [userId, gcalId, calendarName]
+  );
+  return result.rows[0];
+};
+
+const addCalendarEvents = async (calendarId, events) => {
+  if (!Array.isArray(events) || events.length === 0) {
+    return 0;
+  }
+
+  let inserted = 0;
+  for (const event of events) {
+    if (!event || !event.gcalEventId || !event.start || !event.end) {
+      continue;
+    }
+    const result = await pool.query(
+      `INSERT INTO cal_event (calendar_id, gcal_event_id, event_name, event_start, event_end, priority)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       ON CONFLICT (calendar_id, gcal_event_id) DO NOTHING
+       RETURNING event_id`,
+      [
+        calendarId,
+        event.gcalEventId,
+        event.title || null,
+        event.start,
+        event.end,
+        Number.isInteger(event.priority) ? event.priority : 1
+      ]
+    );
+    if (result.rowCount > 0) {
+      inserted += 1;
+    }
+  }
+
+  return inserted;
+};
+
 module.exports = {
   pool,
   query: (text, params) => pool.query(text, params),
@@ -388,5 +432,7 @@ module.exports = {
   deletePetition,
   listPetitionsForAvailability,
   getGroupMemberCount,
-  getGroupMemberIds
+  getGroupMemberIds,
+  upsertCalendarForUser,
+  addCalendarEvents
 };

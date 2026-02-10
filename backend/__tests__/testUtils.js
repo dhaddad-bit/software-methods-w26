@@ -26,7 +26,7 @@ async function runMigrations() {
 
 async function resetDb() {
   await db.query(
-    'TRUNCATE TABLE petition_responses, petitions, group_memberships, groups, users RESTART IDENTITY CASCADE'
+    'TRUNCATE TABLE cal_event, calendar, petition_responses, petitions, group_memberships, groups, users RESTART IDENTITY CASCADE'
   );
 }
 

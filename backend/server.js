@@ -563,16 +563,38 @@ app.get('/api/events', requireAuth, async (req, res) => {
       return res.json([]);
     }
 
-    const formattedEvents = events.map((event) => {
-      const start = event.start.dateTime || event.start.date;
-      const end = event.end.dateTime || event.end.date;
+    const formattedEvents = [];
+    const eventsForDb = [];
 
-      return {
-        title: event.summary || 'No Title',
-        start: start,
-        end: end
-      };
+    events.forEach((event) => {
+      const start = event?.start?.dateTime || event?.start?.date;
+      const end = event?.end?.dateTime || event?.end?.date;
+      if (!start || !end) {
+        return;
+      }
+
+      const title = event.summary || 'No Title';
+      formattedEvents.push({ title, start, end });
+
+      const gcalEventId = event.id || event.iCalUID;
+      if (gcalEventId) {
+        eventsForDb.push({ title, start, end, gcalEventId });
+      }
     });
+
+    if (formattedEvents.length === 0) {
+      return res.json([]);
+    }
+
+    const calendarRecord = await db.upsertCalendarForUser({
+      userId: req.session.userId,
+      gcalId: 'primary',
+      calendarName: 'primary'
+    });
+
+    if (calendarRecord?.calendar_id && eventsForDb.length > 0) {
+      await db.addCalendarEvents(calendarRecord.calendar_id, eventsForDb);
+    }
 
     res.json(formattedEvents);
   } catch (error) {
