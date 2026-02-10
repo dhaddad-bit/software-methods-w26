@@ -1064,9 +1064,19 @@ app.get('/test-session', (req, res) => {
 });
 
 if (require.main === module) {
-  app.listen(PORT, async () => {
-    console.log(`Server running on port ${PORT}`);
-  });
+  (async () => {
+    try {
+      await db.runSchemaMigrations();
+      console.log('DB schema migrations complete');
+    } catch (error) {
+      console.error('Fatal: failed to run DB schema migrations', error);
+      process.exit(1);
+    }
+
+    app.listen(PORT, () => {
+      console.log(`Server running on port ${PORT}`);
+    });
+  })();
 }
 
 module.exports = { app };

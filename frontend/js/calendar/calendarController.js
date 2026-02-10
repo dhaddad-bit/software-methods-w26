@@ -169,10 +169,14 @@ export async function renderCalendar() {
 
   const levelSelect = document.createElement("select");
   levelSelect.className = "event-panel-select";
-  ["B1", "B2", "B3"].forEach((level) => {
+  [
+    { value: "B1", label: "B1 — Low (ignorable)" },
+    { value: "B2", label: "B2 — Medium" },
+    { value: "B3", label: "B3 — High (strict busy)" },
+  ].forEach((level) => {
     const option = document.createElement("option");
-    option.value = level;
-    option.textContent = level;
+    option.value = level.value;
+    option.textContent = level.label;
     levelSelect.appendChild(option);
   });
   levelSelect.value = "B3";
@@ -198,7 +202,7 @@ export async function renderCalendar() {
 
   const savePriorityBtn = document.createElement("button");
   savePriorityBtn.type = "button";
-  savePriorityBtn.textContent = "Save Priority";
+  savePriorityBtn.textContent = "Save Blocking Level";
 
   buttonRow.append(newBtn, createBtn, saveBtn, savePriorityBtn, deleteBtn);
 

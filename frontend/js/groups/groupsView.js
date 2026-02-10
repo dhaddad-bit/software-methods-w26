@@ -202,7 +202,7 @@ export async function renderGroups() {
   const detailSubtitle = document.createElement("p");
   detailSubtitle.className = "group-detail-subtitle";
   detailSubtitle.textContent =
-    "Darker green = more members available. Availability filter: Count all conflicts (B1+B2+B3).";
+    "Darker green = more members available. Conflicts counted: B1 (low) + B2 (med) + B3 (high).";
 
   const levelRow = document.createElement("div");
   levelRow.className = "availability-level-row";
@@ -214,9 +214,9 @@ export async function renderGroups() {
   const levelSelect = document.createElement("select");
   levelSelect.className = "availability-level-select";
   [
-    { value: "AVAILABLE", label: "AVAILABLE (ignore B1+B2)" },
-    { value: "FLEXIBLE", label: "FLEXIBLE (ignore B1)" },
-    { value: "MAYBE", label: "MAYBE (count all)" }
+    { value: "AVAILABLE", label: "Lenient — only B3 blocks" },
+    { value: "FLEXIBLE", label: "Standard — B2+B3 block" },
+    { value: "MAYBE", label: "Strict — B1+B2+B3 block" }
   ].forEach((opt) => {
     const option = document.createElement("option");
     option.value = opt.value;
@@ -331,13 +331,13 @@ export async function renderGroups() {
     const updateSubtitleForLevel = () => {
       if (availabilityLevel === "AVAILABLE") {
         detailSubtitle.textContent =
-          "Darker green = more members available. Availability filter: Ignore B1+B2 conflicts.";
+          "Darker green = more members available. Conflicts counted: B3 (high) only.";
       } else if (availabilityLevel === "FLEXIBLE") {
         detailSubtitle.textContent =
-          "Darker green = more members available. Availability filter: Ignore B1 conflicts.";
+          "Darker green = more members available. Conflicts counted: B2 (med) + B3 (high).";
       } else {
         detailSubtitle.textContent =
-          "Darker green = more members available. Availability filter: Count all conflicts (B1+B2+B3).";
+          "Darker green = more members available. Conflicts counted: B1 (low) + B2 (med) + B3 (high).";
       }
       levelSelect.value = availabilityLevel;
     };

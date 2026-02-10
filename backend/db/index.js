@@ -1,3 +1,5 @@
+const fs = require('fs');
+const path = require('path');
 const { Pool } = require('pg');
 require('dotenv').config({
   path: process.env.NODE_ENV === 'production' ? '.env.production' : '.env.development'
@@ -17,6 +19,58 @@ const pool = new Pool(
         ssl: false
       }
 );
+
+async function runSchemaMigrations() {
+  const basePath = path.join(__dirname, 'table_initialization.sql');
+  const migrationPath = path.join(__dirname, 'priority_migrations.sql');
+
+  const baseSql = fs.readFileSync(basePath, 'utf8');
+  const migrationSql = fs.readFileSync(migrationPath, 'utf8');
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const statements = [baseSql, migrationSql]
+      .join('\n')
+      .split(';')
+      .map((s) => s.trim())
+      .filter(Boolean);
+
+    for (const stmt of statements) {
+      await client.query(stmt);
+    }
+
+    // Legacy upgrade: backfill provider_event_id from gcal_event_id and drop legacy column.
+    const legacyColumnCheck = await client.query(
+      `SELECT 1
+       FROM information_schema.columns
+       WHERE table_name = 'cal_event'
+         AND column_name = 'gcal_event_id'
+       LIMIT 1`
+    );
+
+    if (legacyColumnCheck.rowCount > 0) {
+      await client.query(
+        `UPDATE cal_event
+         SET provider_event_id = gcal_event_id
+         WHERE provider_event_id IS NULL`
+      );
+      await client.query(`ALTER TABLE cal_event DROP COLUMN IF EXISTS gcal_event_id`);
+    }
+
+    await client.query(`ALTER TABLE cal_event ALTER COLUMN provider_event_id SET NOT NULL`);
+
+    await client.query('COMMIT');
+  } catch (err) {
+    try {
+      await client.query('ROLLBACK');
+    } catch (_) {}
+    throw err;
+  } finally {
+    client.release();
+  }
+}
 
 const testConnection = async () => {
   const result = await pool.query('SELECT NOW()');
@@ -678,6 +732,7 @@ const addCalendarEvents = async (calendarId, events) => {
 module.exports = {
   pool,
   query: (text, params) => pool.query(text, params),
+  runSchemaMigrations,
   testConnection,
   upsertUserFromGoogle,
   getUserById,
