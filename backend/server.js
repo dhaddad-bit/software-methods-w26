@@ -131,6 +131,23 @@ function normalizeGoogleDateString(value) {
 const VALID_BLOCKING_LEVELS = new Set(['B1', 'B2', 'B3']);
 const VALID_AVAILABILITY_LEVELS = new Set(['AVAILABLE', 'FLEXIBLE', 'MAYBE']);
 
+function isGoogleAuthExpiredError(error) {
+  const status = error?.code || error?.response?.status || error?.status;
+  if (status === 401 || status === 403) return true;
+
+  const data = error?.response?.data;
+  const oauthError = typeof data?.error === 'string' ? data.error : '';
+  const oauthDescription = typeof data?.error_description === 'string' ? data.error_description : '';
+
+  const message = typeof error?.message === 'string' ? error.message : '';
+  const combined = `${oauthError} ${oauthDescription} ${message}`.toLowerCase();
+
+  if (combined.includes('invalid_grant')) return true;
+  if (combined.includes('invalid credentials')) return true;
+
+  return false;
+}
+
 function normalizeAvailabilityLevel(raw) {
   const value = typeof raw === 'string' ? raw.trim().toUpperCase() : '';
   if (VALID_AVAILABILITY_LEVELS.has(value)) return value;
@@ -197,6 +214,10 @@ async function syncCalendarForUser({ userId, refreshToken, gcalId = 'primary', f
     if (error?.code === 'SYNC_TOKEN_EXPIRED') {
       syncToken = null;
       syncResult = await syncGoogleEvents({ refreshToken, calendarId: gcalId, syncToken: null });
+    } else if (isGoogleAuthExpiredError(error)) {
+      const err = new Error('Google authentication expired');
+      err.code = 'NO_REFRESH_TOKEN';
+      throw err;
     } else {
       throw error;
     }
@@ -429,17 +450,15 @@ app.get('/health', (req, res) => {
 });
 
 app.get('/auth/google', async (req, res) => {
-  const username = req.query.username;
   const state = crypto.randomBytes(32).toString('hex');
   req.session.state = state;
-  req.session.pending_username = username;
 
   const authorizationUrl = oauth2Client.generateAuthUrl({
     access_type: 'offline',
     scope: scopes,
     include_granted_scopes: true,
     state: state,
-    prompt: 'consent'
+    prompt: 'consent select_account'
   });
   res.redirect(authorizationUrl);
 });
@@ -473,7 +492,6 @@ app.get('/oauth2callback', async (req, res) => {
     req.session.isAuthenticated = true;
 
     delete req.session.state;
-    delete req.session.pending_username;
 
     await new Promise((resolve, reject) => {
       req.session.save((saveErr) => {
@@ -797,7 +815,9 @@ app.post('/api/google/sync', requireAuth, async (req, res) => {
   try {
     const user = await db.getUserById(req.session.userId);
     if (!user || !user.google_refresh_token) {
-      return res.status(401).json({ error: 'No tokens found. Please re-authenticate.' });
+      return res.status(401).json({
+        error: 'Google Calendar access missing/expired. Please log out and log in with Google again.'
+      });
     }
 
     const result = await syncCalendarForUser({
@@ -821,7 +841,12 @@ app.post('/api/google/sync', requireAuth, async (req, res) => {
   } catch (error) {
     console.error('Error syncing Google calendar', error);
 
-    if (error.code === 401 || error.code === 403) {
+    if (error.code === 'NO_REFRESH_TOKEN') {
+      req.session.destroy(() => {});
+      return res.status(401).json({ error: 'Authentication expired. Please log in again.' });
+    }
+
+    if (isGoogleAuthExpiredError(error)) {
       req.session.destroy(() => {});
       return res.status(401).json({ error: 'Authentication expired. Please log in again.' });
     }

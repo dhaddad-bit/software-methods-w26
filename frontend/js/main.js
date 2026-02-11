@@ -8,7 +8,8 @@ async function initApp() {
   const user = await getCurrentUser();
 
   if (!user) {
-    window.location.href = "/login.html";
+    window.location.href = "/login";
+    return;
   }
 
   console.log("welcome!");
