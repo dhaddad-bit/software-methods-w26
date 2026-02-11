@@ -121,6 +121,27 @@ button:hover {
   text-align: center;
 }
 
+.group-detail-title-row {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+}
+
+.group-delete-btn {
+  background: #c0392b;
+  border: 0;
+  color: white;
+  border-radius: 6px;
+  padding: 6px 10px;
+  cursor: pointer;
+}
+
+.group-delete-btn:disabled {
+  opacity: 0.7;
+  cursor: default;
+}
+
 .group-detail-subtitle {
   margin-top: 4px;
   color: #555;

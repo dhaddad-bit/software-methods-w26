@@ -28,6 +28,14 @@
   box-shadow: 0 2px 4px rgba(0,0,0,0.1);
 }
 
+.event-description {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
 .calendar-event.source-manual {
   background-color: rgba(52, 73, 94, 0.85);
 }

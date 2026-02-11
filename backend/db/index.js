@@ -41,25 +41,91 @@ async function runSchemaMigrations() {
       await client.query(stmt);
     }
 
-    // Legacy upgrade: backfill provider_event_id from gcal_event_id and drop legacy column.
-    const legacyColumnCheck = await client.query(
-      `SELECT 1
-       FROM information_schema.columns
-       WHERE table_name = 'cal_event'
-         AND column_name = 'gcal_event_id'
-       LIMIT 1`
-    );
-
-    if (legacyColumnCheck.rowCount > 0) {
-      await client.query(
-        `UPDATE cal_event
-         SET provider_event_id = gcal_event_id
-         WHERE provider_event_id IS NULL`
+    async function getColumnFormattedType(tableName, columnName) {
+      const result = await client.query(
+        `SELECT format_type(a.atttypid, a.atttypmod) AS formatted_type
+         FROM pg_attribute a
+         INNER JOIN pg_class c ON c.oid = a.attrelid
+         INNER JOIN pg_namespace n ON n.oid = c.relnamespace
+         WHERE n.nspname = 'public'
+           AND c.relname = $1
+           AND a.attname = $2
+           AND a.attnum > 0
+           AND NOT a.attisdropped
+         LIMIT 1`,
+        [tableName, columnName]
       );
-      await client.query(`ALTER TABLE cal_event DROP COLUMN IF EXISTS gcal_event_id`);
+
+      return result.rows[0]?.formatted_type || null;
     }
 
-    await client.query(`ALTER TABLE cal_event ALTER COLUMN provider_event_id SET NOT NULL`);
+    async function ensureColumnIsText(tableName, columnName) {
+      const tableReg = await client.query(`SELECT to_regclass($1) AS regclass`, [
+        `public.${tableName}`
+      ]);
+      if (!tableReg.rows[0]?.regclass) return;
+
+      const formattedType = await getColumnFormattedType(tableName, columnName);
+      if (!formattedType) return;
+      if (formattedType === 'text') return;
+      if (!formattedType.startsWith('character varying') && formattedType !== 'varchar') return;
+
+      await client.query(
+        `ALTER TABLE ${tableName}
+         ALTER COLUMN ${columnName}
+         TYPE TEXT`
+      );
+    }
+
+    // Legacy upgrade: safely backfill provider_event_id from gcal_event_id (if it exists).
+    const calEventReg = await client.query(`SELECT to_regclass('public.cal_event') AS regclass`);
+    if (calEventReg.rows[0]?.regclass) {
+      const legacyGcalIdType = await getColumnFormattedType('cal_event', 'gcal_event_id');
+      if (legacyGcalIdType) {
+        // If the table is in a partial-migrated state, avoid conflicts with already-populated provider_event_id.
+        const providerIdType = await getColumnFormattedType('cal_event', 'provider_event_id');
+        if (providerIdType) {
+          await client.query(
+            `DELETE FROM cal_event e
+             USING cal_event existing
+             WHERE e.provider_event_id IS NULL
+               AND existing.calendar_id = e.calendar_id
+               AND existing.provider_event_id = e.gcal_event_id`
+          );
+        }
+
+        // De-dupe legacy IDs so the backfill can't violate uniq_cal_event_provider on update.
+        await client.query(
+          `WITH ranked AS (
+             SELECT event_id,
+                    ROW_NUMBER() OVER (PARTITION BY calendar_id, gcal_event_id ORDER BY event_id DESC) AS rn
+             FROM cal_event
+           )
+           DELETE FROM cal_event e
+           USING ranked r
+           WHERE e.event_id = r.event_id
+             AND r.rn > 1`
+        );
+
+        await client.query(
+          `UPDATE cal_event
+           SET provider_event_id = gcal_event_id
+           WHERE provider_event_id IS NULL`
+        );
+        await client.query(`ALTER TABLE cal_event DROP COLUMN IF EXISTS gcal_event_id`);
+      }
+
+      // Hard guard: delete any rows still missing provider_event_id, then enforce NOT NULL.
+      const providerIdTypeFinal = await getColumnFormattedType('cal_event', 'provider_event_id');
+      if (providerIdTypeFinal) {
+        await client.query(`DELETE FROM cal_event WHERE provider_event_id IS NULL`);
+        await client.query(`ALTER TABLE cal_event ALTER COLUMN provider_event_id SET NOT NULL`);
+      }
+    }
+
+    // Data integrity fixups: widen common text fields (guarded by table+column+type).
+    await ensureColumnIsText('user_busy_block', 'title');
+    await ensureColumnIsText('cal_event', 'event_name');
 
     await client.query('COMMIT');
   } catch (err) {
@@ -223,6 +289,58 @@ const addGroupMember = async (groupId, userId, role = null) => {
   return result.rows[0];
 };
 
+const addGroupMemberWithLimit = async ({ groupId, userId, role = null, maxMembers = 8 }) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query(`SELECT id FROM groups WHERE id = $1 FOR UPDATE`, [groupId]);
+
+    const existing = await client.query(
+      `SELECT 1
+       FROM group_memberships
+       WHERE group_id = $1
+         AND user_id = $2
+       LIMIT 1`,
+      [groupId, userId]
+    );
+    if (existing.rowCount > 0) {
+      await client.query('COMMIT');
+      return { row: null, status: 'ALREADY_MEMBER' };
+    }
+
+    const countResult = await client.query(
+      `SELECT COUNT(*)::int AS count
+       FROM group_memberships
+       WHERE group_id = $1`,
+      [groupId]
+    );
+    const count = countResult.rows[0]?.count || 0;
+    if (count >= maxMembers) {
+      const err = new Error(`Group member limit reached (${maxMembers}).`);
+      err.code = 'GROUP_MEMBER_LIMIT';
+      throw err;
+    }
+
+    const inserted = await client.query(
+      `INSERT INTO group_memberships (group_id, user_id, role)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (group_id, user_id) DO NOTHING
+       RETURNING group_id, user_id, role`,
+      [groupId, userId, role]
+    );
+
+    await client.query('COMMIT');
+    return { row: inserted.rows[0] || null, status: inserted.rows[0] ? 'ADDED' : 'ALREADY_MEMBER' };
+  } catch (error) {
+    try {
+      await client.query('ROLLBACK');
+    } catch (_) {}
+    throw error;
+  } finally {
+    client.release();
+  }
+};
+
 const getGroupMembers = async (groupId) => {
   const result = await pool.query(
     `SELECT u.id, u.email, u.name
@@ -245,6 +363,34 @@ const getGroupMembersWithTokens = async (groupId) => {
     [groupId]
   );
   return result.rows;
+};
+
+const deleteGroup = async ({ groupId }) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    await client.query(
+      `DELETE FROM petition_responses
+       WHERE petition_id IN (
+         SELECT id FROM petitions WHERE group_id = $1
+       )`,
+      [groupId]
+    );
+    await client.query(`DELETE FROM petitions WHERE group_id = $1`, [groupId]);
+    await client.query(`DELETE FROM group_memberships WHERE group_id = $1`, [groupId]);
+
+    const result = await client.query(`DELETE FROM groups WHERE id = $1`, [groupId]);
+    await client.query('COMMIT');
+    return result.rowCount;
+  } catch (error) {
+    try {
+      await client.query('ROLLBACK');
+    } catch (_) {}
+    throw error;
+  } finally {
+    client.release();
+  }
 };
 
 const createPetition = async ({
@@ -630,14 +776,77 @@ const updateGoogleEventBlockingLevel = async ({ userId, eventId, blockingLevel }
   return result.rows[0] || null;
 };
 
-const createUserBusyBlock = async ({ userId, title, startTime, endTime, blockingLevel }) => {
-  const result = await pool.query(
-    `INSERT INTO user_busy_block (user_id, title, start_time, end_time, blocking_level)
-     VALUES ($1, $2, $3, $4, $5)
-     RETURNING busy_block_id, user_id, title, start_time, end_time, blocking_level, created_at, updated_at`,
-    [userId, title ?? null, startTime, endTime, blockingLevel]
-  );
-  return result.rows[0];
+const createUserBusyBlock = async ({
+  userId,
+  title,
+  startTime,
+  endTime,
+  blockingLevel,
+  clientRequestId
+}) => {
+  const normalizedTitle = title ?? null;
+  const normalizedRequestId = clientRequestId ?? null;
+
+  try {
+    const result = await pool.query(
+      `INSERT INTO user_busy_block (user_id, title, client_request_id, start_time, end_time, blocking_level)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       RETURNING busy_block_id,
+                 user_id,
+                 title,
+                 client_request_id,
+                 start_time,
+                 end_time,
+                 blocking_level,
+                 created_at,
+                 updated_at`,
+       [userId, normalizedTitle, normalizedRequestId, startTime, endTime, blockingLevel]
+    );
+    return { row: result.rows[0], inserted: true };
+  } catch (error) {
+    if (
+      error?.code === '23505' &&
+      normalizedRequestId &&
+      error?.constraint === 'uniq_user_busy_block_client_request'
+    ) {
+      const existingResult = await pool.query(
+        `SELECT busy_block_id,
+                user_id,
+                title,
+                client_request_id,
+                start_time,
+                end_time,
+                blocking_level,
+                created_at,
+                updated_at
+         FROM user_busy_block
+         WHERE user_id = $1
+           AND client_request_id = $2
+         LIMIT 1`,
+        [userId, normalizedRequestId]
+      );
+
+      const existing = existingResult.rows[0] || null;
+      if (!existing) {
+        throw error;
+      }
+
+      const sameTitle = (existing.title ?? null) === normalizedTitle;
+      const sameLevel = existing.blocking_level === blockingLevel;
+      const sameStart = existing.start_time?.getTime?.() === startTime?.getTime?.();
+      const sameEnd = existing.end_time?.getTime?.() === endTime?.getTime?.();
+
+      if (sameTitle && sameLevel && sameStart && sameEnd) {
+        return { row: existing, inserted: false };
+      }
+
+      const err = new Error('Idempotency key reuse with different payload');
+      err.code = 'IDEMPOTENCY_KEY_REUSE';
+      throw err;
+    }
+
+    throw error;
+  }
 };
 
 const listUserBusyBlocks = async ({ userId, windowStartMs, windowEndMs }) => {
@@ -742,8 +951,10 @@ module.exports = {
   getGroupById,
   isUserInGroup,
   addGroupMember,
+  addGroupMemberWithLimit,
   getGroupMembers,
   getGroupMembersWithTokens,
+  deleteGroup,
   createPetition,
   getPetitionById,
   listGroupPetitions,

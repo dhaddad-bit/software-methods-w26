@@ -9,6 +9,7 @@ const BLOCK_MS = GRANULARITY_MINUTES * 60 * 1000;
 let currentWeekStart = getStartOfWeek(new Date());
 let selectedGroupId = null;
 let currentUserId = null;
+let currentUserEmail = null;
 let windowPointerUpHandler = null;
 let availabilityLevel = "MAYBE";
 
@@ -44,6 +45,7 @@ async function ensureCurrentUserId() {
   const me = await apiGet("/api/me");
   if (me && me.id) {
     currentUserId = me.id;
+    currentUserEmail = typeof me.email === "string" ? me.email : null;
   }
 }
 
@@ -105,6 +107,9 @@ function normalizeAddMemberError(message) {
   const raw = typeof message === "string" ? message : "";
   if (!raw) return "Failed to add member";
   if (raw.toLowerCase().includes("must log in first")) return "User must log in first";
+  if (raw.toLowerCase().includes("already a member")) return "Already a member";
+  if (raw.toLowerCase().includes("cannot add yourself")) return "Cannot add yourself";
+  if (raw.toLowerCase().includes("limit reached")) return "Group full (8)";
   return raw;
 }
 
@@ -255,8 +260,17 @@ export async function renderGroups() {
   const detailHeader = document.createElement("div");
   detailHeader.className = "group-detail-header";
 
+  const titleRow = document.createElement("div");
+  titleRow.className = "group-detail-title-row";
+
   const detailTitle = document.createElement("h3");
   detailTitle.id = "group-detail-title";
+
+  const deleteGroupBtn = document.createElement("button");
+  deleteGroupBtn.type = "button";
+  deleteGroupBtn.className = "group-delete-btn";
+  deleteGroupBtn.textContent = "Delete Group";
+  deleteGroupBtn.hidden = true;
 
   const detailSubtitle = document.createElement("p");
   detailSubtitle.className = "group-detail-subtitle";
@@ -287,7 +301,10 @@ export async function renderGroups() {
   levelRow.appendChild(levelLabel);
   levelRow.appendChild(levelSelect);
 
-  detailHeader.appendChild(detailTitle);
+  titleRow.appendChild(detailTitle);
+  titleRow.appendChild(deleteGroupBtn);
+
+  detailHeader.appendChild(titleRow);
   detailHeader.appendChild(detailSubtitle);
   detailHeader.appendChild(levelRow);
 
@@ -422,6 +439,36 @@ export async function renderGroups() {
 	    const renderGroupId = String(group.id);
 	    detail.hidden = false;
 	    detailTitle.textContent = group.name;
+
+	    const creatorId = group.created_by_user_id ?? group.createdByUserId ?? null;
+	    const canDelete = creatorId !== null && String(creatorId) === String(currentUserId);
+	    deleteGroupBtn.hidden = !canDelete;
+	    deleteGroupBtn.disabled = false;
+	    deleteGroupBtn.onclick = async () => {
+	      if (String(selectedGroupId) !== renderGroupId) return;
+	      const ok = window.confirm(`Delete "${group.name}"? This cannot be undone.`);
+	      if (!ok) return;
+
+	      deleteGroupBtn.disabled = true;
+	      setMessage(detailStatus, "Deleting group...");
+	      try {
+	        const result = await apiDelete(`/api/groups/${group.id}`);
+	        if (result && result.error) {
+	          setMessage(detailStatus, result.error, true);
+	          deleteGroupBtn.disabled = false;
+	          return;
+	        }
+
+	        selectedGroupId = null;
+	        detail.hidden = true;
+	        await loadGroups({ preserveMessage: true });
+	        setMessage(message, `Deleted group "${group.name}".`);
+	      } catch (error) {
+	        setMessage(detailStatus, error.message || "Failed to delete group", true);
+	        deleteGroupBtn.disabled = false;
+	      }
+	    };
+
 	    petitionMessage.textContent = "";
 	    addMembersInput.value = "";
 	    setMessage(membersMessage, "");
@@ -803,6 +850,19 @@ export async function renderGroups() {
 		        return;
 		      }
 
+		      if (currentUserEmail) {
+		        const selfKey = currentUserEmail.toLowerCase();
+		        const includesSelf = emails.some((email) => String(email).toLowerCase() === selfKey);
+		        if (includesSelf) {
+		          setMessage(
+		            membersMessage,
+		            "Remove your own email — you're already a member.",
+		            true
+		          );
+		          return;
+		        }
+		      }
+
 		      addMembersBtn.disabled = true;
 		      setMessage(membersMessage, `Adding members (0/${emails.length})...`);
 
@@ -950,6 +1010,19 @@ export async function renderGroups() {
 	    if (!nameValue) {
 	      setMessage(message, "Group name is required.", true);
 	      return;
+	    }
+
+	    if (currentUserEmail) {
+	      const selfKey = currentUserEmail.toLowerCase();
+	      const includesSelf = emails.some((email) => String(email).toLowerCase() === selfKey);
+	      if (includesSelf) {
+	        setMessage(
+	          message,
+	          "Remove your own email from the member list — you're already a member.",
+	          true
+	        );
+	        return;
+	      }
 	    }
 
 	    createBtn.disabled = true;

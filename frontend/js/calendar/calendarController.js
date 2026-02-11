@@ -146,7 +146,8 @@ export async function renderCalendar() {
   panel.addEventListener("click", (evt) => evt.stopPropagation());
 
   let selectedItem = null;
-  let selectedEl = null;
+  let selectedEls = [];
+  let isSubmittingCreateBusyBlock = false;
 
   const panelTitle = document.createElement("h3");
   panelTitle.textContent = "Event / Busy Block";
@@ -221,8 +222,8 @@ export async function renderCalendar() {
 
   const clearSelection = () => {
     selectedItem = null;
-    if (selectedEl) selectedEl.classList.remove("selected");
-    selectedEl = null;
+    selectedEls.forEach((el) => el.classList.remove("selected"));
+    selectedEls = [];
     setPanelMessage("");
     titleInput.disabled = false;
     startInput.disabled = false;
@@ -238,15 +239,28 @@ export async function renderCalendar() {
   };
 
   const setSelection = (item, el) => {
-    if (selectedEl) selectedEl.classList.remove("selected");
+    selectedEls.forEach((candidate) => candidate.classList.remove("selected"));
     selectedItem = item;
-    selectedEl = el;
-    if (selectedEl) selectedEl.classList.add("selected");
+    selectedEls = [];
+
+    const itemId = String(item?.id ?? "");
+    const source = String(item?.source ?? "");
+    if (itemId && source) {
+      selectedEls = Array.from(
+        gridContainer.querySelectorAll(
+          `.calendar-event[data-source="${source}"][data-item-id="${itemId}"]`
+        )
+      );
+    } else if (el) {
+      selectedEls = [el];
+    }
+
+    selectedEls.forEach((candidate) => candidate.classList.add("selected"));
 
     setPanelMessage("");
     titleInput.value = item.title || "";
-    startInput.value = formatDateTimeLocal(item.start);
-    endInput.value = formatDateTimeLocal(item.end);
+    startInput.value = formatDateTimeLocal(item.fullStartMs ?? item.start);
+    endInput.value = formatDateTimeLocal(item.fullEndMs ?? item.end);
     levelSelect.value = item.blockingLevel || "B3";
 
     if (item.source === "google") {
@@ -360,6 +374,7 @@ export async function renderCalendar() {
   };
 
   createBtn.onclick = async () => {
+    if (isSubmittingCreateBusyBlock) return;
     const startMs = parseDateTimeLocal(startInput.value);
     const endMs = parseDateTimeLocal(endInput.value);
 
@@ -372,20 +387,40 @@ export async function renderCalendar() {
       return;
     }
 
-    const res = await apiPost("/api/busy-blocks", {
-      title: titleInput.value.trim() || "Busy",
-      startMs,
-      endMs,
-      blockingLevel: levelSelect.value
-    });
+    isSubmittingCreateBusyBlock = true;
+    createBtn.disabled = true;
 
-    if (res && res.error) {
-      setPanelMessage(res.error, true);
-      return;
+    let succeeded = false;
+    try {
+      const clientRequestId =
+        typeof crypto?.randomUUID === "function"
+          ? crypto.randomUUID()
+          : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+
+      const res = await apiPost("/api/busy-blocks", {
+        title: titleInput.value.trim() || "Busy",
+        clientRequestId,
+        startMs,
+        endMs,
+        blockingLevel: levelSelect.value
+      });
+
+      if (res && res.error) {
+        setPanelMessage(res.error, true);
+        return;
+      }
+
+      await loadCalendarData();
+      setPanelMessage("Busy block created.");
+      succeeded = true;
+    } catch (error) {
+      console.error("Failed to create busy block", error);
+      setPanelMessage("Failed to create busy block.", true);
+    } finally {
+      isSubmittingCreateBusyBlock = false;
+      if (!succeeded) createBtn.disabled = false;
+      else createBtn.disabled = false; // re-enable after UI refresh completes
     }
-
-    await loadCalendarData();
-    setPanelMessage("Busy block created.");
   };
 
   saveBtn.onclick = async () => {

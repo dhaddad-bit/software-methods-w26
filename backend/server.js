@@ -530,8 +530,43 @@ app.post('/api/groups/:groupId/members', requireAuth, requireGroupMember, async 
     return res.status(404).json({ error: 'User not found. User must log in first.' });
   }
 
-  await db.addGroupMember(req.groupId, user.id, null);
+  if (String(user.id) === String(req.session.userId)) {
+    return res.status(400).json({ error: 'Cannot add yourself; you are already a member.' });
+  }
+
+  try {
+    const result = await db.addGroupMemberWithLimit({
+      groupId: req.groupId,
+      userId: user.id,
+      role: null,
+      maxMembers: 8
+    });
+
+    if (result.status === 'ALREADY_MEMBER') {
+      return res.status(409).json({ error: 'User is already a member.' });
+    }
+  } catch (error) {
+    if (error.code === 'GROUP_MEMBER_LIMIT') {
+      return res.status(400).json({ error: 'Group member limit reached (8).' });
+    }
+    console.error('Error adding group member', error);
+    return res.status(500).json({ error: 'Failed to add member' });
+  }
   return res.status(200).json({ id: user.id, email: user.email, name: user.name });
+});
+
+app.delete('/api/groups/:groupId', requireAuth, requireGroupMember, async (req, res) => {
+  if (String(req.group.created_by_user_id) !== String(req.session.userId)) {
+    return res.status(403).json({ error: 'Only the group creator can delete this group.' });
+  }
+
+  try {
+    await db.deleteGroup({ groupId: req.groupId });
+    return res.json({ ok: true });
+  } catch (error) {
+    console.error('Error deleting group', error);
+    return res.status(500).json({ error: 'Failed to delete group' });
+  }
 });
 
 // ===================PETITIONS========================
@@ -932,6 +967,12 @@ app.post('/api/busy-blocks', requireAuth, async (req, res) => {
   const startMs = parseTimeParam(req.body?.startMs);
   const endMs = parseTimeParam(req.body?.endMs);
   const title = typeof req.body?.title === 'string' ? req.body.title.trim() : '';
+  const clientRequestIdRaw = req.body?.clientRequestId;
+  const clientRequestId =
+    typeof clientRequestIdRaw === 'string' ? clientRequestIdRaw.trim() : '';
+  if (!clientRequestId || clientRequestId.length > 128) {
+    return res.status(400).json({ error: 'clientRequestId is required (max 128 chars)' });
+  }
 
   const levelRaw = typeof req.body?.blockingLevel === 'string' ? req.body.blockingLevel : 'B3';
   const blockingLevel = levelRaw.trim().toUpperCase() || 'B3';
@@ -947,15 +988,17 @@ app.post('/api/busy-blocks', requireAuth, async (req, res) => {
   }
 
   try {
-    const row = await db.createUserBusyBlock({
+    const result = await db.createUserBusyBlock({
       userId: req.session.userId,
       title: title || null,
+      clientRequestId,
       startTime: new Date(startMs),
       endTime: new Date(endMs),
       blockingLevel
     });
 
-    return res.status(201).json({
+    const row = result.row;
+    return res.status(result.inserted ? 201 : 200).json({
       busyBlockId: row.busy_block_id,
       title: row.title || 'Busy',
       start: row.start_time,
@@ -964,6 +1007,9 @@ app.post('/api/busy-blocks', requireAuth, async (req, res) => {
       source: 'manual'
     });
   } catch (error) {
+    if (error.code === 'IDEMPOTENCY_KEY_REUSE') {
+      return res.status(409).json({ error: 'clientRequestId reused with different payload' });
+    }
     console.error('Error creating busy block', error);
     return res.status(500).json({ error: 'Failed to create busy block' });
   }

@@ -1,15 +1,18 @@
+import { parseEventMs, processEventsForRender } from "./renderUtils.mjs";
+
 function eventKey(event) {
+  if (event?.renderKey) return event.renderKey;
   const source = event?.source || "google";
   const id = event?.id ?? event?.eventId ?? event?.busyBlockId ?? "unknown";
   return `${source}:${id}`;
 }
 
 function parseEventDate(value) {
-  if (!value) return null;
-  const date = value instanceof Date ? value : new Date(value);
-  const ms = date.getTime();
-  return Number.isFinite(ms) ? date : null;
+  const ms = parseEventMs(value);
+  return ms === null ? null : new Date(ms);
 }
+
+export { processEventsForRender };
 
 function computeDayLayout(dayEvents) {
   // dayEvents: { event, startMs, endMs }[]
@@ -78,7 +81,7 @@ export async function renderCalendarGrid(container, weekStart, events, options =
     days.push(d);
   }
 
-  const rawEvents = Array.isArray(events) ? events : [];
+  const rawEvents = processEventsForRender(events);
   const layoutByKey = new Map();
   const startsByCell = new Map(); // dayKey|hour -> [eventRenderItem]
 
@@ -158,7 +161,10 @@ export async function renderCalendarGrid(container, weekStart, events, options =
 
         const eventDiv = document.createElement("div");
         eventDiv.className = "calendar-event";
-        eventDiv.textContent = event.title || "No Title";
+        const label = document.createElement("div");
+        label.className = "event-description";
+        label.textContent = event.title || "No Title";
+        eventDiv.appendChild(label);
 
         const source = event.source || "google";
         const blockingLevel = (event.blockingLevel || "B3").toLowerCase();
