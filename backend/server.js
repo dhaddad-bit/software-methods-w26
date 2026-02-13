@@ -9,6 +9,16 @@ const url = require('url');
 const pgSession = require('connect-pg-simple')(session);
 const { computeAvailabilityBlocks } = require('./algorithm/index.cjs');
 const { syncGoogleEvents } = require('./services/googleCalendar');
+const {
+  computeInviteExpiry,
+  buildInviteToken,
+  parseInviteToken
+} = require('./invites/service');
+const {
+  normalizeNotificationLimit,
+  normalizeNotificationOffset,
+  mapNotificationRow
+} = require('./notifications/service');
 
 // .env config
 require('dotenv').config({
@@ -67,6 +77,48 @@ const scopes = [
 ];
 
 const PORT = process.env.PORT || 3000;
+let oauthCodeExchange = async (code) => {
+  const { tokens } = await oauth2Client.getToken(code);
+  oauth2Client.setCredentials(tokens);
+
+  const oauth2 = google.oauth2({ version: 'v2', auth: oauth2Client });
+  const { data: userInfo } = await oauth2.userinfo.get();
+
+  return { tokens, userInfo };
+};
+
+function setOAuthCodeExchangeForTest(handler) {
+  if (typeof handler !== 'function') {
+    throw new Error('handler must be a function');
+  }
+  oauthCodeExchange = handler;
+}
+
+function resetOAuthCodeExchangeForTest() {
+  oauthCodeExchange = async (code) => {
+    const { tokens } = await oauth2Client.getToken(code);
+    oauth2Client.setCredentials(tokens);
+
+    const oauth2 = google.oauth2({ version: 'v2', auth: oauth2Client });
+    const { data: userInfo } = await oauth2.userinfo.get();
+
+    return { tokens, userInfo };
+  };
+}
+
+function isValidOAuthState(sessionState, queryState) {
+  if (typeof sessionState !== 'string' || !sessionState) return false;
+  if (typeof queryState !== 'string' || !queryState) return false;
+
+  const expectedBuffer = Buffer.from(sessionState);
+  const providedBuffer = Buffer.from(queryState);
+
+  if (expectedBuffer.length !== providedBuffer.length) {
+    return false;
+  }
+
+  return crypto.timingSafeEqual(expectedBuffer, providedBuffer);
+}
 
 function requireAuth(req, res, next) {
   if (!req.session.userId) {
@@ -161,8 +213,50 @@ function availabilityLevelToMinBlockingLevel(level) {
   return 'B1'; // MAYBE (strict)
 }
 
+function resolveInviteStatus(inviteRow) {
+  if (!inviteRow) return null;
+  if (inviteRow.status !== 'PENDING') return inviteRow.status;
+  const expiresAtMs = toEpochMs(inviteRow.expires_at);
+  if (Number.isFinite(expiresAtMs) && Date.now() > expiresAtMs) {
+    return 'EXPIRED';
+  }
+  return inviteRow.status;
+}
+
+function mapInviteRow(inviteRow, options = {}) {
+  if (!inviteRow) return null;
+  const status = resolveInviteStatus(inviteRow);
+  const mapped = {
+    inviteId: inviteRow.invite_id,
+    groupId: inviteRow.group_id,
+    createdByUserId: inviteRow.created_by_user_id,
+    targetEmail: inviteRow.target_email,
+    status,
+    expiresAt: inviteRow.expires_at,
+    acceptedByUserId: inviteRow.accepted_by_user_id,
+    acceptedAt: inviteRow.accepted_at,
+    revokedByUserId: inviteRow.revoked_by_user_id,
+    revokedAt: inviteRow.revoked_at,
+    createdAt: inviteRow.created_at,
+    updatedAt: inviteRow.updated_at
+  };
+  if (options.token) {
+    mapped.token = options.token;
+  }
+  return mapped;
+}
+
+function buildInviteLink(req, token) {
+  const frontendBase =
+    typeof process.env.FRONTEND_URL === 'string' && process.env.FRONTEND_URL.trim()
+      ? process.env.FRONTEND_URL.replace(/\/+$/, '')
+      : `${req.protocol}://${req.get('host')}`;
+  return `${frontendBase}/invite/${encodeURIComponent(token)}`;
+}
+
 const PETITION_GRANULARITY_MINUTES = 15;
 const PETITION_PRIORITY_DEFAULT = 'HIGHEST';
+const MAX_GROUP_MEMBERS = 8;
 
 const CALENDAR_SYNC_TTL_MS = 5 * 60 * 1000;
 
@@ -471,12 +565,18 @@ app.get('/oauth2callback', async (req, res) => {
     return res.redirect(frontend + '/error.html');
   }
 
-  try {
-    const { tokens } = await oauth2Client.getToken(q.code);
-    oauth2Client.setCredentials(tokens);
+  const queryState = typeof q.state === 'string' ? q.state : '';
+  const sessionState = req.session?.state;
 
-    const oauth2 = google.oauth2({ version: 'v2', auth: oauth2Client });
-    const { data: userInfo } = await oauth2.userinfo.get();
+  if (!isValidOAuthState(sessionState, queryState)) {
+    delete req.session.state;
+    return res.redirect(frontend + '/error.html?error=invalid_state');
+  }
+
+  delete req.session.state;
+
+  try {
+    const { tokens, userInfo } = await oauthCodeExchange(q.code);
 
     const displayName = userInfo.name || `${userInfo.given_name || ''} ${userInfo.family_name || ''}`.trim();
     const refreshToken = tokens.refresh_token || null;
@@ -490,8 +590,6 @@ app.get('/oauth2callback', async (req, res) => {
 
     req.session.userId = user.id;
     req.session.isAuthenticated = true;
-
-    delete req.session.state;
 
     await new Promise((resolve, reject) => {
       req.session.save((saveErr) => {
@@ -557,7 +655,7 @@ app.post('/api/groups/:groupId/members', requireAuth, requireGroupMember, async 
       groupId: req.groupId,
       userId: user.id,
       role: null,
-      maxMembers: 8
+      maxMembers: MAX_GROUP_MEMBERS
     });
 
     if (result.status === 'ALREADY_MEMBER') {
@@ -565,12 +663,211 @@ app.post('/api/groups/:groupId/members', requireAuth, requireGroupMember, async 
     }
   } catch (error) {
     if (error.code === 'GROUP_MEMBER_LIMIT') {
-      return res.status(400).json({ error: 'Group member limit reached (8).' });
+      return res.status(400).json({ error: `Group member limit reached (${MAX_GROUP_MEMBERS}).` });
     }
     console.error('Error adding group member', error);
     return res.status(500).json({ error: 'Failed to add member' });
   }
   return res.status(200).json({ id: user.id, email: user.email, name: user.name });
+});
+
+app.delete(
+  '/api/groups/:groupId/members/:userId',
+  requireAuth,
+  requireGroupMember,
+  async (req, res) => {
+    const targetUserId = Number.parseInt(req.params.userId, 10);
+    if (!Number.isInteger(targetUserId)) {
+      return res.status(400).json({ error: 'Invalid userId' });
+    }
+
+    if (targetUserId === Number(req.group.created_by_user_id)) {
+      return res.status(400).json({ error: 'Cannot remove the group creator from the group.' });
+    }
+
+    const requesterIsCreator = Number(req.group.created_by_user_id) === Number(req.session.userId);
+    const requesterIsTarget = Number(req.session.userId) === targetUserId;
+
+    if (!requesterIsCreator && !requesterIsTarget) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+
+    const wasMember = await db.isUserInGroup(req.groupId, targetUserId);
+    if (!wasMember) {
+      return res.json({ ok: true, alreadyRemoved: true });
+    }
+
+    const deletedCount = await db.removeGroupMember({
+      groupId: req.groupId,
+      userId: targetUserId
+    });
+
+    return res.json({ ok: true, alreadyRemoved: deletedCount === 0 });
+  }
+);
+
+app.post('/api/groups/:groupId/invites', requireAuth, requireGroupMember, async (req, res) => {
+  const targetEmailRaw = typeof req.body?.targetEmail === 'string' ? req.body.targetEmail : '';
+  const targetEmail = targetEmailRaw.trim().toLowerCase() || null;
+  const ttlHoursRaw = req.body?.ttlHours;
+  let ttlHours = undefined;
+
+  if (ttlHoursRaw !== undefined && ttlHoursRaw !== null && ttlHoursRaw !== '') {
+    const parsed = Number.parseInt(ttlHoursRaw, 10);
+    if (!Number.isInteger(parsed) || parsed <= 0 || parsed > 24 * 30) {
+      return res.status(400).json({ error: 'ttlHours must be an integer between 1 and 720' });
+    }
+    ttlHours = parsed;
+  }
+
+  const expiresAt = computeInviteExpiry({ ttlHours });
+  const invite = await db.createGroupInvite({
+    groupId: req.groupId,
+    createdByUserId: req.session.userId,
+    targetEmail,
+    expiresAt
+  });
+
+  const token = buildInviteToken({
+    inviteId: invite.invite_id,
+    groupId: invite.group_id,
+    expiresAt: invite.expires_at
+  });
+
+  return res.status(201).json({
+    ...mapInviteRow(invite, { token }),
+    inviteLink: buildInviteLink(req, token)
+  });
+});
+
+app.get('/api/groups/:groupId/invites', requireAuth, requireGroupMember, async (req, res) => {
+  const invites = await db.listGroupInvites({ groupId: req.groupId });
+  return res.json(invites.map((row) => mapInviteRow(row)));
+});
+
+app.delete('/api/groups/:groupId/invites/:inviteId', requireAuth, requireGroupMember, async (req, res) => {
+  const inviteId = Number.parseInt(req.params.inviteId, 10);
+  if (!Number.isInteger(inviteId)) {
+    return res.status(400).json({ error: 'Invalid inviteId' });
+  }
+
+  const outcome = await db.revokeGroupInvite({
+    groupId: req.groupId,
+    inviteId,
+    revokedByUserId: req.session.userId
+  });
+
+  if (outcome.status === 'NOT_FOUND') {
+    return res.status(404).json({ error: 'Invite not found' });
+  }
+  if (outcome.status === 'CONFLICT_ACCEPTED') {
+    return res.status(409).json({
+      error: 'Invite has already been accepted and cannot be revoked',
+      invite: mapInviteRow(outcome.invite)
+    });
+  }
+
+  return res.json({
+    ok: true,
+    status: outcome.status,
+    alreadyRevoked: outcome.status === 'ALREADY_REVOKED',
+    alreadyExpired: outcome.status === 'ALREADY_EXPIRED',
+    invite: mapInviteRow(outcome.invite)
+  });
+});
+
+app.get('/api/invites/:token', async (req, res) => {
+  const verification = parseInviteToken(req.params.token);
+  if (!verification.valid && verification.reason !== 'expired') {
+    return res.status(400).json({ error: 'Invalid invite token', reason: verification.reason });
+  }
+
+  if (!Number.isInteger(verification.inviteId) || verification.inviteId <= 0) {
+    return res.status(400).json({ error: 'Unsupported invite token version' });
+  }
+
+  const invite = await db.getGroupInviteById(verification.inviteId);
+  if (!invite) {
+    return res.status(404).json({ error: 'Invite not found' });
+  }
+  if (invite.group_id !== verification.groupId) {
+    return res.status(400).json({ error: 'Invite token does not match invitation record' });
+  }
+
+  const group = await db.getGroupById(invite.group_id);
+  const status = resolveInviteStatus(invite);
+
+  return res.json({
+    invite: mapInviteRow({ ...invite, status }),
+    group: group ? { id: group.id, name: group.name } : null,
+    canAccept: status === 'PENDING',
+    tokenStatus: verification.valid ? 'VALID' : String(verification.reason || 'invalid').toUpperCase()
+  });
+});
+
+app.post('/api/invites/:token/accept', requireAuth, async (req, res) => {
+  const verification = parseInviteToken(req.params.token);
+  if (!verification.valid) {
+    const statusCode = verification.reason === 'expired' ? 410 : 400;
+    return res.status(statusCode).json({
+      error: verification.reason === 'expired' ? 'Invite token expired' : 'Invalid invite token',
+      reason: verification.reason
+    });
+  }
+
+  if (!Number.isInteger(verification.inviteId) || verification.inviteId <= 0) {
+    return res.status(400).json({ error: 'Unsupported invite token version' });
+  }
+
+  const invite = await db.getGroupInviteById(verification.inviteId);
+  if (!invite) {
+    return res.status(404).json({ error: 'Invite not found' });
+  }
+  if (invite.group_id !== verification.groupId) {
+    return res.status(400).json({ error: 'Invite token does not match invitation record' });
+  }
+
+  if (invite.target_email) {
+    const currentUser = await db.getUserById(req.session.userId);
+    const currentEmail = (currentUser?.email || '').trim().toLowerCase();
+    if (currentEmail !== invite.target_email.trim().toLowerCase()) {
+      return res.status(403).json({ error: 'Invite is restricted to a different email address' });
+    }
+  }
+
+  const accepted = await db.acceptGroupInvite({
+    inviteId: verification.inviteId,
+    tokenGroupId: verification.groupId,
+    userId: req.session.userId,
+    maxMembers: MAX_GROUP_MEMBERS
+  });
+
+  if (accepted.status === 'NOT_FOUND') {
+    return res.status(404).json({ error: 'Invite not found' });
+  }
+  if (accepted.status === 'TOKEN_GROUP_MISMATCH') {
+    return res.status(400).json({ error: 'Invite token does not match invitation record' });
+  }
+  if (accepted.status === 'REVOKED') {
+    return res.status(410).json({ error: 'Invite has been revoked' });
+  }
+  if (accepted.status === 'EXPIRED') {
+    return res.status(410).json({ error: 'Invite has expired' });
+  }
+  if (accepted.status === 'GROUP_MEMBER_LIMIT') {
+    return res.status(409).json({ error: `Group member limit reached (${MAX_GROUP_MEMBERS}).` });
+  }
+  if (accepted.status === 'INVALID_STATE') {
+    return res.status(409).json({ error: 'Invite is not in an acceptable state' });
+  }
+
+  return res.json({
+    ok: true,
+    status: accepted.status,
+    alreadyMember: accepted.status === 'ALREADY_MEMBER',
+    alreadyAccepted: accepted.status === 'ALREADY_ACCEPTED',
+    invite: mapInviteRow(accepted.invite)
+  });
 });
 
 app.delete('/api/groups/:groupId', requireAuth, requireGroupMember, async (req, res) => {
@@ -637,7 +934,7 @@ app.post('/api/groups/:groupId/petitions', requireAuth, requireGroupMember, asyn
         .json({ error: 'Selected window is not fully available for all members' });
     }
 
-    const petition = await db.createPetition({
+    const petitionResult = await db.createPetitionWithNotifications({
       groupId: req.groupId,
       createdByUserId: req.session.userId,
       title: title || 'Petitioned Meeting',
@@ -646,14 +943,7 @@ app.post('/api/groups/:groupId/petitions', requireAuth, requireGroupMember, asyn
       priority: priority || PETITION_PRIORITY_DEFAULT,
       status: 'OPEN'
     });
-
-    await db.upsertPetitionResponse({
-      petitionId: petition.id,
-      userId: req.session.userId,
-      response: 'ACCEPTED'
-    });
-
-    const groupSize = await db.getGroupMemberCount(req.groupId);
+    const { petition, groupSize } = petitionResult;
 
     return res.status(201).json({
       ...petition,
@@ -707,34 +997,17 @@ app.post('/api/petitions/:petitionId/respond', requireAuth, async (req, res) => 
     return res.status(403).json({ error: 'Forbidden' });
   }
 
-  await db.upsertPetitionResponse({
+  const responseResult = await db.respondToPetitionWithNotifications({
     petitionId,
     userId: req.session.userId,
     response: normalizedResponse
   });
 
-  const counts = await db.getPetitionResponseCounts(petitionId);
-  const acceptedCount = Number.parseInt(counts.accepted_count, 10) || 0;
-  const declinedCount = Number.parseInt(counts.declined_count, 10) || 0;
-  const groupSize = await db.getGroupMemberCount(petition.group_id);
-
-  let nextStatus = 'OPEN';
-  if (declinedCount > 0) {
-    nextStatus = 'FAILED';
-  } else if (acceptedCount === groupSize) {
-    nextStatus = 'ACCEPTED_ALL';
-  }
-
-  let updatedPetition = petition;
-  if (petition.status !== nextStatus) {
-    updatedPetition = await db.updatePetitionStatus(petitionId, nextStatus);
-  }
-
   return res.json({
-    ...updatedPetition,
-    acceptedCount,
-    declinedCount,
-    groupSize,
+    ...responseResult.petition,
+    acceptedCount: responseResult.acceptedCount,
+    declinedCount: responseResult.declinedCount,
+    groupSize: responseResult.groupSize,
     currentUserResponse: normalizedResponse
   });
 });
@@ -760,6 +1033,64 @@ app.delete('/api/petitions/:petitionId', requireAuth, async (req, res) => {
 
   await db.deletePetition(petitionId);
   return res.json({ ok: true });
+});
+
+app.get('/api/notifications', requireAuth, async (req, res) => {
+  const limit = normalizeNotificationLimit(req.query.limit);
+  const offset = normalizeNotificationOffset(req.query.offset);
+
+  const notifications = await db.listNotificationsForUser({
+    userId: req.session.userId,
+    limit,
+    offset
+  });
+
+  return res.json({
+    limit,
+    offset,
+    items: notifications.map((row) => mapNotificationRow(row))
+  });
+});
+
+app.post('/api/notifications/:notificationId/read', requireAuth, async (req, res) => {
+  const notificationId = Number.parseInt(req.params.notificationId, 10);
+  if (!Number.isInteger(notificationId)) {
+    return res.status(400).json({ error: 'Invalid notificationId' });
+  }
+
+  const updated = await db.markNotificationRead({
+    userId: req.session.userId,
+    notificationId
+  });
+  if (!updated) {
+    return res.status(404).json({ error: 'Notification not found' });
+  }
+
+  return res.json(mapNotificationRow(updated));
+});
+
+app.post('/api/notifications/read-all', requireAuth, async (req, res) => {
+  const updatedCount = await db.markAllNotificationsRead({
+    userId: req.session.userId
+  });
+  return res.json({ ok: true, updatedCount });
+});
+
+app.delete('/api/notifications/:notificationId', requireAuth, async (req, res) => {
+  const notificationId = Number.parseInt(req.params.notificationId, 10);
+  if (!Number.isInteger(notificationId)) {
+    return res.status(400).json({ error: 'Invalid notificationId' });
+  }
+
+  const deleted = await db.deleteNotificationForUser({
+    userId: req.session.userId,
+    notificationId
+  });
+
+  return res.json({
+    ok: true,
+    alreadyDeleted: deleted === 0
+  });
 });
 
 // ===================AVAILABILITY========================
@@ -1150,4 +1481,9 @@ if (require.main === module) {
   })();
 }
 
-module.exports = { app };
+module.exports = {
+  app,
+  isValidOAuthState,
+  setOAuthCodeExchangeForTest,
+  resetOAuthCodeExchangeForTest
+};

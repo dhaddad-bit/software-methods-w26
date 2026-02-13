@@ -20,18 +20,37 @@ const pool = new Pool(
       }
 );
 
+async function withTransaction(handler) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const out = await handler(client);
+    await client.query('COMMIT');
+    return out;
+  } catch (error) {
+    try {
+      await client.query('ROLLBACK');
+    } catch (_) {}
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
 async function runSchemaMigrations() {
   const basePath = path.join(__dirname, 'table_initialization.sql');
   const migrationPath = path.join(__dirname, 'priority_migrations.sql');
+  const inviteNotificationPath = path.join(__dirname, 'invite_notification_migrations.sql');
 
   const baseSql = fs.readFileSync(basePath, 'utf8');
   const migrationSql = fs.readFileSync(migrationPath, 'utf8');
+  const inviteNotificationSql = fs.readFileSync(inviteNotificationPath, 'utf8');
 
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
 
-    const statements = [baseSql, migrationSql]
+    const statements = [baseSql, migrationSql, inviteNotificationSql]
       .join('\n')
       .split(';')
       .map((s) => s.trim())
@@ -341,6 +360,16 @@ const addGroupMemberWithLimit = async ({ groupId, userId, role = null, maxMember
   }
 };
 
+const removeGroupMember = async ({ groupId, userId }) => {
+  const result = await pool.query(
+    `DELETE FROM group_memberships
+     WHERE group_id = $1
+       AND user_id = $2`,
+    [groupId, userId]
+  );
+  return result.rowCount;
+};
+
 const getGroupMembers = async (groupId) => {
   const result = await pool.query(
     `SELECT u.id, u.email, u.name
@@ -562,6 +591,659 @@ const getGroupMemberIds = async (groupId) => {
     [groupId]
   );
   return result.rows.map((row) => row.user_id);
+};
+
+const createGroupInvite = async ({ groupId, createdByUserId, targetEmail = null, expiresAt }) => {
+  const normalizedEmail =
+    typeof targetEmail === 'string' && targetEmail.trim() ? targetEmail.trim().toLowerCase() : null;
+
+  const result = await pool.query(
+    `INSERT INTO group_invites (
+       group_id,
+       created_by_user_id,
+       target_email,
+       status,
+       expires_at
+     )
+     VALUES ($1, $2, $3, 'PENDING', $4)
+     RETURNING invite_id,
+               group_id,
+               created_by_user_id,
+               target_email,
+               status,
+               expires_at,
+               accepted_by_user_id,
+               accepted_at,
+               revoked_by_user_id,
+               revoked_at,
+               created_at,
+               updated_at`,
+    [groupId, createdByUserId, normalizedEmail, expiresAt]
+  );
+  return result.rows[0];
+};
+
+const listGroupInvites = async ({ groupId }) => {
+  const result = await pool.query(
+    `SELECT invite_id,
+            group_id,
+            created_by_user_id,
+            target_email,
+            status,
+            expires_at,
+            accepted_by_user_id,
+            accepted_at,
+            revoked_by_user_id,
+            revoked_at,
+            created_at,
+            updated_at
+     FROM group_invites
+     WHERE group_id = $1
+     ORDER BY invite_id DESC`,
+    [groupId]
+  );
+  return result.rows;
+};
+
+const getGroupInviteById = async (inviteId) => {
+  const result = await pool.query(
+    `SELECT invite_id,
+            group_id,
+            created_by_user_id,
+            target_email,
+            status,
+            expires_at,
+            accepted_by_user_id,
+            accepted_at,
+            revoked_by_user_id,
+            revoked_at,
+            created_at,
+            updated_at
+     FROM group_invites
+     WHERE invite_id = $1`,
+    [inviteId]
+  );
+  return result.rows[0] || null;
+};
+
+const revokeGroupInvite = async ({ groupId, inviteId, revokedByUserId }) =>
+  withTransaction(async (client) => {
+    const lockResult = await client.query(
+      `SELECT invite_id,
+              group_id,
+              created_by_user_id,
+              target_email,
+              status,
+              expires_at,
+              accepted_by_user_id,
+              accepted_at,
+              revoked_by_user_id,
+              revoked_at,
+              created_at,
+              updated_at
+       FROM group_invites
+       WHERE invite_id = $1
+         AND group_id = $2
+       FOR UPDATE`,
+      [inviteId, groupId]
+    );
+    const invite = lockResult.rows[0] || null;
+    if (!invite) return { status: 'NOT_FOUND', invite: null };
+
+    const nowMs = Date.now();
+    const expiresAtMs = invite.expires_at?.getTime?.() || null;
+    const isExpired = Number.isFinite(expiresAtMs) && nowMs > expiresAtMs;
+
+    if (invite.status === 'ACCEPTED') return { status: 'CONFLICT_ACCEPTED', invite };
+    if (invite.status === 'REVOKED') return { status: 'ALREADY_REVOKED', invite };
+    if (invite.status === 'EXPIRED' || isExpired) {
+      const expiredUpdate = await client.query(
+        `UPDATE group_invites
+         SET status = 'EXPIRED',
+             updated_at = NOW()
+         WHERE invite_id = $1
+         RETURNING invite_id,
+                   group_id,
+                   created_by_user_id,
+                   target_email,
+                   status,
+                   expires_at,
+                   accepted_by_user_id,
+                   accepted_at,
+                   revoked_by_user_id,
+                   revoked_at,
+                   created_at,
+                   updated_at`,
+        [inviteId]
+      );
+      return { status: 'ALREADY_EXPIRED', invite: expiredUpdate.rows[0] || invite };
+    }
+
+    const updated = await client.query(
+      `UPDATE group_invites
+       SET status = 'REVOKED',
+           revoked_by_user_id = $2,
+           revoked_at = NOW(),
+           updated_at = NOW()
+       WHERE invite_id = $1
+       RETURNING invite_id,
+                 group_id,
+                 created_by_user_id,
+                 target_email,
+                 status,
+                 expires_at,
+                 accepted_by_user_id,
+                 accepted_at,
+                 revoked_by_user_id,
+                 revoked_at,
+                 created_at,
+                 updated_at`,
+      [inviteId, revokedByUserId]
+    );
+
+    return { status: 'REVOKED', invite: updated.rows[0] || null };
+  });
+
+const acceptGroupInvite = async ({ inviteId, tokenGroupId, userId, maxMembers = 8 }) =>
+  withTransaction(async (client) => {
+    const inviteResult = await client.query(
+      `SELECT invite_id,
+              group_id,
+              created_by_user_id,
+              target_email,
+              status,
+              expires_at,
+              accepted_by_user_id,
+              accepted_at,
+              revoked_by_user_id,
+              revoked_at,
+              created_at,
+              updated_at
+       FROM group_invites
+       WHERE invite_id = $1
+       FOR UPDATE`,
+      [inviteId]
+    );
+    const invite = inviteResult.rows[0] || null;
+    if (!invite) return { status: 'NOT_FOUND', invite: null, memberAdded: false };
+    if (Number.isInteger(tokenGroupId) && invite.group_id !== tokenGroupId) {
+      return { status: 'TOKEN_GROUP_MISMATCH', invite, memberAdded: false };
+    }
+
+    const nowMs = Date.now();
+    const expiresAtMs = invite.expires_at?.getTime?.() || null;
+    const isExpired = Number.isFinite(expiresAtMs) && nowMs > expiresAtMs;
+
+    if (invite.status === 'REVOKED') return { status: 'REVOKED', invite, memberAdded: false };
+    if (invite.status === 'EXPIRED' || isExpired) {
+      const expired = await client.query(
+        `UPDATE group_invites
+         SET status = 'EXPIRED',
+             updated_at = NOW()
+         WHERE invite_id = $1
+         RETURNING invite_id,
+                   group_id,
+                   created_by_user_id,
+                   target_email,
+                   status,
+                   expires_at,
+                   accepted_by_user_id,
+                   accepted_at,
+                   revoked_by_user_id,
+                   revoked_at,
+                   created_at,
+                   updated_at`,
+        [inviteId]
+      );
+      return { status: 'EXPIRED', invite: expired.rows[0] || invite, memberAdded: false };
+    }
+
+    await client.query(`SELECT id FROM groups WHERE id = $1 FOR UPDATE`, [invite.group_id]);
+
+    const membershipBefore = await client.query(
+      `SELECT 1
+       FROM group_memberships
+       WHERE group_id = $1
+         AND user_id = $2
+       LIMIT 1`,
+      [invite.group_id, userId]
+    );
+    const wasAlreadyMember = membershipBefore.rowCount > 0;
+
+    if (!wasAlreadyMember) {
+      const countResult = await client.query(
+        `SELECT COUNT(*)::int AS count
+         FROM group_memberships
+         WHERE group_id = $1`,
+        [invite.group_id]
+      );
+      const count = countResult.rows[0]?.count || 0;
+      if (count >= maxMembers) {
+        return { status: 'GROUP_MEMBER_LIMIT', invite, memberAdded: false };
+      }
+    }
+
+    const addResult = await client.query(
+      `INSERT INTO group_memberships (group_id, user_id, role)
+       VALUES ($1, $2, NULL)
+       ON CONFLICT (group_id, user_id) DO NOTHING
+       RETURNING group_id, user_id`,
+      [invite.group_id, userId]
+    );
+    const memberAdded = addResult.rowCount > 0;
+
+    if (invite.status === 'PENDING') {
+      const updated = await client.query(
+        `UPDATE group_invites
+         SET status = 'ACCEPTED',
+             accepted_by_user_id = COALESCE(accepted_by_user_id, $2),
+             accepted_at = COALESCE(accepted_at, NOW()),
+             updated_at = NOW()
+         WHERE invite_id = $1
+         RETURNING invite_id,
+                   group_id,
+                   created_by_user_id,
+                   target_email,
+                   status,
+                   expires_at,
+                   accepted_by_user_id,
+                   accepted_at,
+                   revoked_by_user_id,
+                   revoked_at,
+                   created_at,
+                   updated_at`,
+        [inviteId, userId]
+      );
+      return {
+        status: wasAlreadyMember ? 'ALREADY_MEMBER' : 'ACCEPTED',
+        invite: updated.rows[0] || invite,
+        memberAdded
+      };
+    }
+
+    if (invite.status === 'ACCEPTED') {
+      return { status: 'ALREADY_ACCEPTED', invite, memberAdded };
+    }
+
+    return { status: 'INVALID_STATE', invite, memberAdded: false };
+  });
+
+const listNotificationsForUser = async ({ userId, limit = 50, offset = 0 }) => {
+  const result = await pool.query(
+    `SELECT notification_id,
+            recipient_user_id,
+            type,
+            event_key,
+            payload_json,
+            is_read,
+            read_at,
+            created_at,
+            updated_at
+     FROM notifications
+     WHERE recipient_user_id = $1
+     ORDER BY notification_id DESC
+     LIMIT $2 OFFSET $3`,
+    [userId, limit, offset]
+  );
+  return result.rows;
+};
+
+const markNotificationRead = async ({ userId, notificationId }) => {
+  const result = await pool.query(
+    `UPDATE notifications
+     SET is_read = TRUE,
+         read_at = COALESCE(read_at, NOW()),
+         updated_at = NOW()
+     WHERE notification_id = $1
+       AND recipient_user_id = $2
+     RETURNING notification_id,
+               recipient_user_id,
+               type,
+               event_key,
+               payload_json,
+               is_read,
+               read_at,
+               created_at,
+               updated_at`,
+    [notificationId, userId]
+  );
+  return result.rows[0] || null;
+};
+
+const markAllNotificationsRead = async ({ userId }) => {
+  const result = await pool.query(
+    `UPDATE notifications
+     SET is_read = TRUE,
+         read_at = COALESCE(read_at, NOW()),
+         updated_at = NOW()
+     WHERE recipient_user_id = $1
+       AND is_read = FALSE`,
+    [userId]
+  );
+  return result.rowCount;
+};
+
+const deleteNotificationForUser = async ({ userId, notificationId }) => {
+  const result = await pool.query(
+    `DELETE FROM notifications
+     WHERE notification_id = $1
+       AND recipient_user_id = $2`,
+    [notificationId, userId]
+  );
+  return result.rowCount;
+};
+
+async function insertNotificationAndOutboxTx(client, { recipientUserId, type, payload, eventKey }) {
+  const notificationResult = await client.query(
+    `INSERT INTO notifications (recipient_user_id, type, event_key, payload_json)
+     VALUES ($1, $2, $3, $4::jsonb)
+     ON CONFLICT (recipient_user_id, event_key)
+     WHERE event_key IS NOT NULL
+     DO UPDATE SET updated_at = NOW()
+     RETURNING notification_id,
+               recipient_user_id,
+               type,
+               event_key,
+               payload_json,
+               is_read,
+               read_at,
+               created_at,
+               updated_at`,
+    [recipientUserId, type, eventKey ?? null, JSON.stringify(payload || {})]
+  );
+
+  const notification = notificationResult.rows[0];
+  const dedupeKey = `${type}:${notification.notification_id}`;
+
+  await client.query(
+    `INSERT INTO notification_outbox (
+       notification_id,
+       channel,
+       dedupe_key,
+       status,
+       attempt_count,
+       next_attempt_at
+     )
+     VALUES ($1, 'EMAIL', $2, 'PENDING', 0, NOW())
+     ON CONFLICT (dedupe_key) DO NOTHING`,
+    [notification.notification_id, dedupeKey]
+  );
+
+  return notification;
+}
+
+const createPetitionWithNotifications = async ({
+  groupId,
+  createdByUserId,
+  title,
+  startTime,
+  endTime,
+  priority = 'HIGHEST',
+  status = 'OPEN'
+}) =>
+  withTransaction(async (client) => {
+    const petitionResult = await client.query(
+      `INSERT INTO petitions (group_id, created_by_user_id, title, start_time, end_time, priority, status)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       RETURNING id, group_id, created_by_user_id, title, start_time, end_time, priority, status, created_at, updated_at`,
+      [groupId, createdByUserId, title, startTime, endTime, priority, status]
+    );
+    const petition = petitionResult.rows[0];
+
+    await client.query(
+      `INSERT INTO petition_responses (petition_id, user_id, response)
+       VALUES ($1, $2, 'ACCEPTED')
+       ON CONFLICT (petition_id, user_id)
+       DO UPDATE SET response = EXCLUDED.response, responded_at = NOW()`,
+      [petition.id, createdByUserId]
+    );
+
+    const memberIdsResult = await client.query(
+      `SELECT user_id
+       FROM group_memberships
+       WHERE group_id = $1
+       ORDER BY user_id`,
+      [groupId]
+    );
+    const memberIds = memberIdsResult.rows.map((row) => row.user_id);
+
+    for (const memberId of memberIds) {
+      if (Number(memberId) === Number(createdByUserId)) continue;
+      await insertNotificationAndOutboxTx(client, {
+        recipientUserId: memberId,
+        type: 'PETITION_CREATED',
+        payload: {
+          petitionId: petition.id,
+          groupId,
+          createdByUserId,
+          title: petition.title,
+          startTime: petition.start_time,
+          endTime: petition.end_time
+        },
+        eventKey: `petition:${petition.id}:created:${memberId}`
+      });
+    }
+
+    return { petition, groupSize: memberIds.length };
+  });
+
+const respondToPetitionWithNotifications = async ({
+  petitionId,
+  userId,
+  response,
+  nextStatus
+}) =>
+  withTransaction(async (client) => {
+    const petitionResult = await client.query(
+      `SELECT id, group_id, created_by_user_id, title, start_time, end_time, priority, status, created_at, updated_at
+       FROM petitions
+       WHERE id = $1
+       FOR UPDATE`,
+      [petitionId]
+    );
+    const petition = petitionResult.rows[0] || null;
+    if (!petition) {
+      const err = new Error('Petition not found');
+      err.code = 'PETITION_NOT_FOUND';
+      throw err;
+    }
+
+    await client.query(
+      `INSERT INTO petition_responses (petition_id, user_id, response)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (petition_id, user_id)
+       DO UPDATE SET response = EXCLUDED.response, responded_at = NOW()`,
+      [petitionId, userId, response]
+    );
+
+    const countsResult = await client.query(
+      `SELECT
+          COUNT(*) FILTER (WHERE response = 'ACCEPTED') AS accepted_count,
+          COUNT(*) FILTER (WHERE response = 'DECLINED') AS declined_count
+       FROM petition_responses
+       WHERE petition_id = $1`,
+      [petitionId]
+    );
+    const counts = countsResult.rows[0];
+    const acceptedCount = Number.parseInt(counts.accepted_count, 10) || 0;
+    const declinedCount = Number.parseInt(counts.declined_count, 10) || 0;
+
+    const groupSizeResult = await client.query(
+      `SELECT COUNT(*)::int AS count
+       FROM group_memberships
+       WHERE group_id = $1`,
+      [petition.group_id]
+    );
+    const groupSize = groupSizeResult.rows[0]?.count || 0;
+
+    let resolvedStatus = nextStatus;
+    if (!resolvedStatus) {
+      if (declinedCount > 0) resolvedStatus = 'FAILED';
+      else if (acceptedCount === groupSize) resolvedStatus = 'ACCEPTED_ALL';
+      else resolvedStatus = 'OPEN';
+    }
+
+    let updatedPetition = petition;
+    if (petition.status !== resolvedStatus) {
+      const updateResult = await client.query(
+        `UPDATE petitions
+         SET status = $2,
+             updated_at = NOW()
+         WHERE id = $1
+         RETURNING id, group_id, created_by_user_id, title, start_time, end_time, priority, status, created_at, updated_at`,
+        [petitionId, resolvedStatus]
+      );
+      updatedPetition = updateResult.rows[0];
+    }
+
+    if (Number(userId) !== Number(petition.created_by_user_id)) {
+      await insertNotificationAndOutboxTx(client, {
+        recipientUserId: petition.created_by_user_id,
+        type: 'PETITION_RESPONSE',
+        payload: {
+          petitionId: petition.id,
+          groupId: petition.group_id,
+          responderUserId: userId,
+          response
+        },
+        eventKey: `petition:${petition.id}:response:${userId}:${response}`
+      });
+    }
+
+    if (petition.status !== resolvedStatus && ['FAILED', 'ACCEPTED_ALL'].includes(resolvedStatus)) {
+      const membersResult = await client.query(
+        `SELECT user_id
+         FROM group_memberships
+         WHERE group_id = $1
+         ORDER BY user_id`,
+        [petition.group_id]
+      );
+      for (const member of membersResult.rows) {
+        await insertNotificationAndOutboxTx(client, {
+          recipientUserId: member.user_id,
+          type: 'PETITION_STATUS',
+          payload: {
+            petitionId: petition.id,
+            groupId: petition.group_id,
+            status: resolvedStatus
+          },
+          eventKey: `petition:${petition.id}:status:${resolvedStatus}:${member.user_id}`
+        });
+      }
+    }
+
+    return {
+      petition: updatedPetition,
+      acceptedCount,
+      declinedCount,
+      groupSize
+    };
+  });
+
+const claimOutboxBatch = async ({ limit = 25, now = new Date() } = {}) =>
+  withTransaction(async (client) => {
+    const claimResult = await client.query(
+      `WITH to_claim AS (
+         SELECT outbox_id
+         FROM notification_outbox
+         WHERE status IN ('PENDING', 'FAILED')
+           AND COALESCE(next_attempt_at, NOW()) <= $2
+         ORDER BY outbox_id
+         LIMIT $1
+         FOR UPDATE SKIP LOCKED
+       )
+       UPDATE notification_outbox o
+       SET status = 'PROCESSING',
+           updated_at = NOW()
+       FROM to_claim
+       WHERE o.outbox_id = to_claim.outbox_id
+       RETURNING o.outbox_id,
+                 o.notification_id,
+                 o.channel,
+                 o.dedupe_key,
+                 o.status,
+                 o.attempt_count,
+                 o.next_attempt_at,
+                 o.last_error,
+                 o.sent_at,
+                 o.created_at,
+                 o.updated_at`,
+      [limit, now]
+    );
+    return claimResult.rows;
+  });
+
+const getNotificationById = async (notificationId) => {
+  const result = await pool.query(
+    `SELECT notification_id,
+            recipient_user_id,
+            type,
+            event_key,
+            payload_json,
+            is_read,
+            read_at,
+            created_at,
+            updated_at
+     FROM notifications
+     WHERE notification_id = $1`,
+    [notificationId]
+  );
+  return result.rows[0] || null;
+};
+
+const markOutboxSent = async ({ outboxId }) => {
+  const result = await pool.query(
+    `UPDATE notification_outbox
+     SET status = 'SENT',
+         sent_at = NOW(),
+         updated_at = NOW(),
+         next_attempt_at = NULL,
+         last_error = NULL
+     WHERE outbox_id = $1
+     RETURNING outbox_id,
+               notification_id,
+               channel,
+               dedupe_key,
+               status,
+               attempt_count,
+               next_attempt_at,
+               last_error,
+               sent_at,
+               created_at,
+               updated_at`,
+    [outboxId]
+  );
+  return result.rows[0] || null;
+};
+
+const markOutboxFailure = async ({
+  outboxId,
+  lastError,
+  nextAttemptAt,
+  maxAttempts = 5
+}) => {
+  const result = await pool.query(
+    `UPDATE notification_outbox
+     SET attempt_count = attempt_count + 1,
+         status = CASE WHEN attempt_count + 1 >= $4 THEN 'DEAD' ELSE 'FAILED' END,
+         next_attempt_at = CASE WHEN attempt_count + 1 >= $4 THEN NULL ELSE $3 END,
+         last_error = $2,
+         updated_at = NOW()
+     WHERE outbox_id = $1
+     RETURNING outbox_id,
+               notification_id,
+               channel,
+               dedupe_key,
+               status,
+               attempt_count,
+               next_attempt_at,
+               last_error,
+               sent_at,
+               created_at,
+               updated_at`,
+    [outboxId, lastError || null, nextAttemptAt || null, maxAttempts]
+  );
+  return result.rows[0] || null;
 };
 
 const upsertCalendarForUser = async ({ userId, gcalId = 'primary', calendarName = null }) => {
@@ -941,6 +1623,7 @@ const addCalendarEvents = async (calendarId, events) => {
 module.exports = {
   pool,
   query: (text, params) => pool.query(text, params),
+  withTransaction,
   runSchemaMigrations,
   testConnection,
   upsertUserFromGoogle,
@@ -952,20 +1635,36 @@ module.exports = {
   isUserInGroup,
   addGroupMember,
   addGroupMemberWithLimit,
+  removeGroupMember,
   getGroupMembers,
   getGroupMembersWithTokens,
   deleteGroup,
+  createGroupInvite,
+  listGroupInvites,
+  getGroupInviteById,
+  revokeGroupInvite,
+  acceptGroupInvite,
   createPetition,
+  createPetitionWithNotifications,
   getPetitionById,
   listGroupPetitions,
   listUserPetitions,
   upsertPetitionResponse,
+  respondToPetitionWithNotifications,
   getPetitionResponseCounts,
   updatePetitionStatus,
   deletePetition,
   listPetitionsForAvailability,
   getGroupMemberCount,
   getGroupMemberIds,
+  listNotificationsForUser,
+  markNotificationRead,
+  markAllNotificationsRead,
+  deleteNotificationForUser,
+  claimOutboxBatch,
+  getNotificationById,
+  markOutboxSent,
+  markOutboxFailure,
   upsertCalendarForUser,
   getOrCreateCalendar,
   getCalendarSyncState,

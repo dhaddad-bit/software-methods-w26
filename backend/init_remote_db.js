@@ -21,11 +21,13 @@ async function run() {
     // Read the SQL files
     const sqlPath = path.join(__dirname, 'db', 'table_initialization.sql');
     const migrationPath = path.join(__dirname, 'db', 'priority_migrations.sql');
+    const inviteNotificationPath = path.join(__dirname, 'db', 'invite_notification_migrations.sql');
     const sql = fs.readFileSync(sqlPath, 'utf8');
     const migrations = fs.readFileSync(migrationPath, 'utf8');
+    const inviteNotificationMigrations = fs.readFileSync(inviteNotificationPath, 'utf8');
 
     console.log('⏳ Running table initialization + migrations...');
-    await client.query(`${sql}\n${migrations}`);
+    await client.query(`${sql}\n${migrations}\n${inviteNotificationMigrations}`);
 
     // Legacy upgrade: if cal_event.gcal_event_id exists, backfill provider_event_id and drop it.
     const legacyCheck = await client.query(
