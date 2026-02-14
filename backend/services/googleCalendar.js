@@ -69,6 +69,32 @@ async function listGoogleEvents({ refreshToken, timeMin, timeMax }) {
   return response.data.items || [];
 }
 
+async function listGoogleCalendars({ refreshToken }) {
+  const auth = createOAuthClient();
+  auth.setCredentials({ refresh_token: refreshToken });
+
+  const calendar = google.calendar({ version: 'v3', auth });
+
+  const items = [];
+  let pageToken = undefined;
+  do {
+    const response = await calendar.calendarList.list({
+      pageToken,
+      maxResults: 250
+    });
+    items.push(...(response.data.items || []));
+    pageToken = response.data.nextPageToken || undefined;
+  } while (pageToken);
+
+  return items.map((entry) => ({
+    id: entry.id,
+    summary: entry.summary || entry.id || 'calendar',
+    primary: Boolean(entry.primary),
+    accessRole: entry.accessRole || null,
+    selected: entry.selected !== false
+  }));
+}
+
 async function syncGoogleEvents({ refreshToken, calendarId = 'primary', syncToken = null }) {
   const auth = createOAuthClient();
   auth.setCredentials({ refresh_token: refreshToken });
@@ -140,6 +166,7 @@ async function fetchBusyIntervalsForUser({ userId, refreshToken, windowStartMs, 
 
 module.exports = {
   listGoogleEvents,
+  listGoogleCalendars,
   syncGoogleEvents,
   normalizeEventsToIntervals,
   fetchBusyIntervalsForUser

@@ -287,9 +287,25 @@ export async function renderCalendar() {
     gridContainer.innerHTML = "";
     clearSelection();
 
-    const syncRes = await apiPost("/api/google/sync", { calendarId: "primary", force: false });
+    const syncRes = await apiPost("/api/google/sync", {
+      calendarId: "primary",
+      force: false,
+      includeAllCalendars: true,
+      diagnostics: true,
+      windowStartMs: week.startMs,
+      windowEndMs: week.endMs
+    });
     if (syncRes && syncRes.error) {
-      setPanelMessage(syncRes.error, true);
+      const codeText = syncRes.code ? ` (${syncRes.code})` : "";
+      setPanelMessage(`${syncRes.error}${codeText}`, true);
+    } else if (
+      syncRes?.diagnostics &&
+      Number.isInteger(syncRes.diagnostics.windowEventCount) &&
+      syncRes.diagnostics.windowEventCount === 0
+    ) {
+      const mode =
+        syncRes.diagnostics.mode === "ALL_CALENDARS" ? "all calendars" : "primary calendar";
+      setPanelMessage(`Sync complete: no events found in this week window from ${mode}.`);
     }
 
     const [googleEvents, busyBlocks] = await Promise.all([

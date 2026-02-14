@@ -41,6 +41,9 @@ Set **exactly these 6** in Render:
 5. `SESSION_SECRET` = *random long string*
 6. `FRONTEND_URL` = `https://<YOUR-APP-NAME>.onrender.com`
 
+Optional (recommended for better calendar coverage):
+- `GOOGLE_SYNC_ALL_CALENDARS_DEFAULT` = `true` (syncs all selected calendars, not just `primary`)
+
 > Render typically sets `NODE_ENV=production`. If not, add it manually.
 
 ## 4) Local Development

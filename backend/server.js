@@ -8,7 +8,7 @@ const session = require('express-session');
 const url = require('url');
 const pgSession = require('connect-pg-simple')(session);
 const { computeAvailabilityBlocks } = require('./algorithm/index.cjs');
-const { syncGoogleEvents } = require('./services/googleCalendar');
+const { syncGoogleEvents, listGoogleCalendars } = require('./services/googleCalendar');
 const {
   computeInviteExpiry,
   buildInviteToken,
@@ -159,6 +159,15 @@ function parseTimeParam(value) {
   return parsed;
 }
 
+function parseBooleanParam(value, fallback = false) {
+  if (value === undefined || value === null || value === '') return fallback;
+  if (typeof value === 'boolean') return value;
+  const normalized = String(value).trim().toLowerCase();
+  if (['1', 'true', 'yes', 'on'].includes(normalized)) return true;
+  if (['0', 'false', 'no', 'off'].includes(normalized)) return false;
+  return fallback;
+}
+
 function toEpochMs(value) {
   if (!value) return null;
   if (typeof value === 'number') return Number.isFinite(value) ? value : null;
@@ -178,6 +187,92 @@ function normalizeGoogleDateString(value) {
     return `${value}T00:00:00Z`;
   }
   return value;
+}
+
+function getGoogleErrorDetails(error) {
+  const status = error?.code || error?.response?.status || error?.status || 500;
+  const data = error?.response?.data;
+  const nestedError = data?.error;
+  const oauthError =
+    typeof nestedError === 'string'
+      ? nestedError
+      : typeof nestedError?.status === 'string'
+        ? nestedError.status
+        : null;
+  const oauthDescription =
+    typeof data?.error_description === 'string' ? data.error_description : null;
+  const reason =
+    data?.error?.errors?.[0]?.reason ||
+    data?.error?.details?.[0]?.reason ||
+    null;
+  const message =
+    oauthDescription ||
+    data?.error?.message ||
+    error?.message ||
+    'Unknown Google API error';
+
+  return {
+    status,
+    oauthError,
+    oauthDescription,
+    reason,
+    message
+  };
+}
+
+function classifyGoogleSyncFailure(error) {
+  if (error?.code === 'NO_REFRESH_TOKEN') {
+    return {
+      code: 'NO_REFRESH_TOKEN',
+      message: 'Google Calendar access missing/expired. Please log out and log in with Google again.'
+    };
+  }
+  if (error?.code === 'SYNC_TOKEN_EXPIRED') {
+    return {
+      code: 'SYNC_TOKEN_EXPIRED',
+      message: 'Google sync token expired; full re-sync is required.'
+    };
+  }
+
+  const details = getGoogleErrorDetails(error);
+  const combined = `${details.oauthError || ''} ${details.oauthDescription || ''} ${details.message || ''}`
+    .trim()
+    .toLowerCase();
+
+  if (combined.includes('invalid_grant') || combined.includes('invalid credentials')) {
+    return {
+      code: 'INVALID_GRANT',
+      message: 'Google refresh token is invalid or revoked. User must re-authenticate.',
+      details
+    };
+  }
+  if (combined.includes('could not determine client id from request')) {
+    return {
+      code: 'GOOGLE_CLIENT_CONFIG_ERROR',
+      message: 'Google OAuth client configuration mismatch (client ID / secret / redirect URI).',
+      details
+    };
+  }
+  if (details.status === 401 || details.status === 403) {
+    return {
+      code: 'GOOGLE_AUTH_EXPIRED',
+      message: 'Google authentication expired or lacks required permissions.',
+      details
+    };
+  }
+  if (details.status === 400) {
+    return {
+      code: 'GOOGLE_BAD_REQUEST',
+      message: details.message || 'Google API rejected the sync request.',
+      details
+    };
+  }
+
+  return {
+    code: 'GOOGLE_SYNC_FAILED',
+    message: details.message || 'Google calendar sync failed unexpectedly.',
+    details
+  };
 }
 
 const VALID_BLOCKING_LEVELS = new Set(['B1', 'B2', 'B3']);
@@ -260,7 +355,49 @@ const MAX_GROUP_MEMBERS = 8;
 
 const CALENDAR_SYNC_TTL_MS = 5 * 60 * 1000;
 
-async function syncCalendarForUser({ userId, refreshToken, gcalId = 'primary', force = false }) {
+function dedupeCalendarTargets(calendars) {
+  const seen = new Set();
+  const out = [];
+  for (const calendar of calendars) {
+    const id = typeof calendar?.id === 'string' ? calendar.id.trim() : '';
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    out.push({
+      id,
+      summary: calendar.summary || id,
+      primary: Boolean(calendar.primary),
+      selected: calendar.selected !== false
+    });
+  }
+  return out;
+}
+
+async function resolveCalendarTargets({ refreshToken, gcalId = 'primary', includeAllCalendars = false }) {
+  if (!includeAllCalendars) {
+    return [{ id: gcalId || 'primary', summary: gcalId || 'primary', primary: gcalId === 'primary' }];
+  }
+
+  const list = await listGoogleCalendars({ refreshToken });
+  const filtered = dedupeCalendarTargets(list.filter((entry) => entry.selected !== false));
+  if (filtered.length === 0) {
+    return [{ id: 'primary', summary: 'primary', primary: true }];
+  }
+
+  filtered.sort((left, right) => {
+    if (left.primary && !right.primary) return -1;
+    if (!left.primary && right.primary) return 1;
+    return String(left.summary || left.id).localeCompare(String(right.summary || right.id));
+  });
+  return filtered;
+}
+
+async function syncSingleGoogleCalendar({
+  userId,
+  refreshToken,
+  gcalId,
+  calendarName,
+  force = false
+}) {
   if (!refreshToken) {
     const err = new Error('No refresh token for user');
     err.code = 'NO_REFRESH_TOKEN';
@@ -270,7 +407,7 @@ async function syncCalendarForUser({ userId, refreshToken, gcalId = 'primary', f
   const calendarRecord = await db.getOrCreateCalendar({
     userId,
     gcalId,
-    calendarName: gcalId
+    calendarName: calendarName || gcalId
   });
 
   const calendarDbId = calendarRecord?.calendar_id;
@@ -288,12 +425,15 @@ async function syncCalendarForUser({ userId, refreshToken, gcalId = 'primary', f
     Date.now() - lastSyncedMs < CALENDAR_SYNC_TTL_MS
   ) {
     return {
+      gcalId,
+      calendarName: calendarName || gcalId,
       calendarDbId,
       skipped: true,
       inserted: 0,
       updated: 0,
       cancelled: 0,
-      fullSync: false,
+      fullSync: Boolean(existingState?.last_full_synced_at),
+      fetchedItems: 0,
       syncTokenUpdated: false
     };
   }
@@ -311,6 +451,7 @@ async function syncCalendarForUser({ userId, refreshToken, gcalId = 'primary', f
     } else if (isGoogleAuthExpiredError(error)) {
       const err = new Error('Google authentication expired');
       err.code = 'NO_REFRESH_TOKEN';
+      err.cause = error;
       throw err;
     } else {
       throw error;
@@ -368,13 +509,84 @@ async function syncCalendarForUser({ userId, refreshToken, gcalId = 'primary', f
   await db.upsertCalendarSyncState(nextState);
 
   return {
+    gcalId,
+    calendarName: calendarName || gcalId,
     calendarDbId,
     skipped: false,
     inserted,
     updated,
     cancelled,
+    fetchedItems: items.length,
     fullSync: Boolean(syncResult?.fullSync),
     syncTokenUpdated: nextSyncToken !== startingSyncToken
+  };
+}
+
+async function syncCalendarForUser({
+  userId,
+  refreshToken,
+  gcalId = 'primary',
+  force = false,
+  includeAllCalendars = false
+}) {
+  if (!refreshToken) {
+    const err = new Error('No refresh token for user');
+    err.code = 'NO_REFRESH_TOKEN';
+    throw err;
+  }
+
+  const targets = await resolveCalendarTargets({
+    refreshToken,
+    gcalId,
+    includeAllCalendars
+  });
+
+  const calendarResults = [];
+  const failedCalendars = [];
+
+  for (const target of targets) {
+    try {
+      const result = await syncSingleGoogleCalendar({
+        userId,
+        refreshToken,
+        gcalId: target.id,
+        calendarName: target.summary || target.id,
+        force
+      });
+      calendarResults.push(result);
+    } catch (error) {
+      if (error?.code === 'NO_REFRESH_TOKEN') {
+        throw error;
+      }
+
+      failedCalendars.push({
+        gcalId: target.id,
+        calendarName: target.summary || target.id,
+        ...getGoogleErrorDetails(error)
+      });
+    }
+  }
+
+  if (calendarResults.length === 0 && failedCalendars.length > 0) {
+    const err = new Error('All calendar sync targets failed');
+    err.code = 'GOOGLE_SYNC_FAILED';
+    err.failedCalendars = failedCalendars;
+    throw err;
+  }
+
+  return {
+    calendarDbId: calendarResults[0]?.calendarDbId || null,
+    calendarId: includeAllCalendars ? 'all' : (gcalId || 'primary'),
+    skipped: calendarResults.every((entry) => entry.skipped),
+    inserted: calendarResults.reduce((total, entry) => total + entry.inserted, 0),
+    updated: calendarResults.reduce((total, entry) => total + entry.updated, 0),
+    cancelled: calendarResults.reduce((total, entry) => total + entry.cancelled, 0),
+    fetchedItems: calendarResults.reduce((total, entry) => total + (entry.fetchedItems || 0), 0),
+    fullSync: calendarResults.some((entry) => entry.fullSync),
+    syncTokenUpdated: calendarResults.some((entry) => entry.syncTokenUpdated),
+    calendars: calendarResults,
+    failedCalendars,
+    calendarTargetCount: targets.length
   };
 }
 
@@ -389,7 +601,11 @@ async function buildParticipantsWithPetitions(groupId, windowStartMs, windowEndM
           userId: member.id,
           refreshToken: member.google_refresh_token,
           gcalId: 'primary',
-          force: false
+          force: false,
+          includeAllCalendars: parseBooleanParam(
+            process.env.GOOGLE_SYNC_ALL_CALENDARS_DEFAULT,
+            true
+          )
         })
       )
     );
@@ -1142,12 +1358,20 @@ app.post('/api/google/sync', requireAuth, async (req, res) => {
       ? req.body.calendarId.trim()
       : 'primary';
   const force = Boolean(req.body?.force);
+  const includeAllCalendars = parseBooleanParam(
+    req.body?.includeAllCalendars,
+    parseBooleanParam(process.env.GOOGLE_SYNC_ALL_CALENDARS_DEFAULT, false)
+  );
+  const diagnosticsRequested = parseBooleanParam(req.body?.diagnostics, false);
+  const windowStartMs = parseTimeParam(req.body?.windowStartMs);
+  const windowEndMs = parseTimeParam(req.body?.windowEndMs);
 
   try {
     const user = await db.getUserById(req.session.userId);
     if (!user || !user.google_refresh_token) {
       return res.status(401).json({
-        error: 'Google Calendar access missing/expired. Please log out and log in with Google again.'
+        error: 'Google Calendar access missing/expired. Please log out and log in with Google again.',
+        code: 'NO_REFRESH_TOKEN'
       });
     }
 
@@ -1155,34 +1379,96 @@ app.post('/api/google/sync', requireAuth, async (req, res) => {
       userId: req.session.userId,
       refreshToken: user.google_refresh_token,
       gcalId: calendarId,
-      force
+      force,
+      includeAllCalendars
     });
 
+    let diagnostics = undefined;
+    if (diagnosticsRequested) {
+      const totalCountResult = await db.query(
+        `SELECT COUNT(*)::int AS count
+         FROM cal_event e
+         INNER JOIN calendar c ON c.calendar_id = e.calendar_id
+         WHERE c.user_id = $1
+           AND e.status != 'cancelled'`,
+        [req.session.userId]
+      );
+
+      let windowCount = null;
+      if (Number.isFinite(windowStartMs) && Number.isFinite(windowEndMs) && windowEndMs > windowStartMs) {
+        const windowCountResult = await db.query(
+          `SELECT COUNT(*)::int AS count
+           FROM cal_event e
+           INNER JOIN calendar c ON c.calendar_id = e.calendar_id
+           WHERE c.user_id = $1
+             AND e.status != 'cancelled'
+             AND e.event_start < $3
+             AND e.event_end > $2`,
+          [req.session.userId, new Date(windowStartMs), new Date(windowEndMs)]
+        );
+        windowCount = windowCountResult.rows[0]?.count ?? 0;
+      }
+
+      diagnostics = {
+        mode: includeAllCalendars ? 'ALL_CALENDARS' : 'PRIMARY_ONLY',
+        calendarTargetCount: result.calendarTargetCount || 0,
+        fetchedItems: result.fetchedItems || 0,
+        failedCalendars: result.failedCalendars || [],
+        totalStoredEvents: totalCountResult.rows[0]?.count ?? 0,
+        windowEventCount: windowCount,
+        windowStartMs: Number.isFinite(windowStartMs) ? windowStartMs : null,
+        windowEndMs: Number.isFinite(windowEndMs) ? windowEndMs : null
+      };
+    }
+
     return res.json({
-      calendarId,
+      calendarId: result.calendarId || calendarId,
       calendarDbId: result.calendarDbId,
+      includeAllCalendars,
       fullSync: result.fullSync,
       skipped: result.skipped,
       syncedAt: new Date().toISOString(),
       inserted: result.inserted,
       updated: result.updated,
       cancelled: result.cancelled,
-      syncTokenUpdated: result.syncTokenUpdated
+      fetchedItems: result.fetchedItems,
+      syncTokenUpdated: result.syncTokenUpdated,
+      calendars: result.calendars,
+      failedCalendars: result.failedCalendars,
+      diagnostics
     });
   } catch (error) {
-    console.error('Error syncing Google calendar', error);
+    const classified = classifyGoogleSyncFailure(error);
+    console.error('Error syncing Google calendar', {
+      userId: req.session.userId,
+      code: classified.code,
+      details: classified.details,
+      error: error?.message
+    });
 
-    if (error.code === 'NO_REFRESH_TOKEN') {
+    if (classified.code === 'NO_REFRESH_TOKEN' || classified.code === 'INVALID_GRANT' || classified.code === 'GOOGLE_AUTH_EXPIRED') {
       req.session.destroy(() => {});
-      return res.status(401).json({ error: 'Authentication expired. Please log in again.' });
+      return res.status(401).json({
+        error: 'Authentication expired. Please log in again.',
+        code: classified.code,
+        details: classified.details || null
+      });
     }
 
-    if (isGoogleAuthExpiredError(error)) {
-      req.session.destroy(() => {});
-      return res.status(401).json({ error: 'Authentication expired. Please log in again.' });
+    if (classified.code === 'GOOGLE_CLIENT_CONFIG_ERROR') {
+      return res.status(500).json({
+        error: classified.message,
+        code: classified.code,
+        details: classified.details || null
+      });
     }
 
-    return res.status(500).json({ error: 'Failed to sync Google calendar' });
+    return res.status(502).json({
+      error: classified.message || 'Failed to sync Google calendar',
+      code: classified.code,
+      details: classified.details || null,
+      failedCalendars: error?.failedCalendars || []
+    });
   }
 });
 
