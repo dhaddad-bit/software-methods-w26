@@ -290,7 +290,7 @@ export async function renderCalendar() {
     const syncRes = await apiPost("/api/google/sync", {
       calendarId: "primary",
       force: false,
-      includeAllCalendars: true,
+      includeAllCalendars: false,
       diagnostics: true,
       windowStartMs: week.startMs,
       windowEndMs: week.endMs

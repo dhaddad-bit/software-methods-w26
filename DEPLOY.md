@@ -42,7 +42,8 @@ Set **exactly these 6** in Render:
 6. `FRONTEND_URL` = `https://<YOUR-APP-NAME>.onrender.com`
 
 Optional (recommended for better calendar coverage):
-- `GOOGLE_SYNC_ALL_CALENDARS_DEFAULT` = `true` (syncs all selected calendars, not just `primary`)
+- `GOOGLE_SYNC_ALLOW_ALL_CALENDARS` = `false` (default safety: only sync `primary`)
+- `GOOGLE_SYNC_ALL_CALENDARS_DEFAULT` = `false` (only used when allow flag is true)
 
 > Render typically sets `NODE_ENV=production`. If not, add it manually.
 

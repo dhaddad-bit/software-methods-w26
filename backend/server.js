@@ -604,7 +604,7 @@ async function buildParticipantsWithPetitions(groupId, windowStartMs, windowEndM
           force: false,
           includeAllCalendars: parseBooleanParam(
             process.env.GOOGLE_SYNC_ALL_CALENDARS_DEFAULT,
-            true
+            false
           )
         })
       )
@@ -1358,10 +1358,15 @@ app.post('/api/google/sync', requireAuth, async (req, res) => {
       ? req.body.calendarId.trim()
       : 'primary';
   const force = Boolean(req.body?.force);
-  const includeAllCalendars = parseBooleanParam(
+  const allowAllCalendars = parseBooleanParam(
+    process.env.GOOGLE_SYNC_ALLOW_ALL_CALENDARS,
+    false
+  );
+  const requestedIncludeAllCalendars = parseBooleanParam(
     req.body?.includeAllCalendars,
     parseBooleanParam(process.env.GOOGLE_SYNC_ALL_CALENDARS_DEFAULT, false)
   );
+  const includeAllCalendars = allowAllCalendars && requestedIncludeAllCalendars;
   const diagnosticsRequested = parseBooleanParam(req.body?.diagnostics, false);
   const windowStartMs = parseTimeParam(req.body?.windowStartMs);
   const windowEndMs = parseTimeParam(req.body?.windowEndMs);
@@ -1411,6 +1416,8 @@ app.post('/api/google/sync', requireAuth, async (req, res) => {
 
       diagnostics = {
         mode: includeAllCalendars ? 'ALL_CALENDARS' : 'PRIMARY_ONLY',
+        requestedIncludeAllCalendars,
+        allowAllCalendars,
         calendarTargetCount: result.calendarTargetCount || 0,
         fetchedItems: result.fetchedItems || 0,
         failedCalendars: result.failedCalendars || [],
