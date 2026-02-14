@@ -461,6 +461,7 @@ async function syncSingleGoogleCalendar({
   const items = Array.isArray(syncResult?.items) ? syncResult.items : [];
   const cancelledProviderEventIds = [];
   const eventsForDb = [];
+  let invalidEventsSkipped = 0;
 
   for (const item of items) {
     const providerEventId = item?.id;
@@ -475,6 +476,13 @@ async function syncSingleGoogleCalendar({
     const start = normalizeGoogleDateString(item?.start?.dateTime || item?.start?.date);
     const end = normalizeGoogleDateString(item?.end?.dateTime || item?.end?.date);
     if (!start || !end) continue;
+
+    const startMs = Date.parse(start);
+    const endMs = Date.parse(end);
+    if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) {
+      invalidEventsSkipped += 1;
+      continue;
+    }
 
     const originalStartTime = normalizeGoogleDateString(
       item?.originalStartTime?.dateTime || item?.originalStartTime?.date
@@ -516,6 +524,7 @@ async function syncSingleGoogleCalendar({
     inserted,
     updated,
     cancelled,
+    invalidEventsSkipped,
     fetchedItems: items.length,
     fullSync: Boolean(syncResult?.fullSync),
     syncTokenUpdated: nextSyncToken !== startingSyncToken
@@ -581,6 +590,10 @@ async function syncCalendarForUser({
     inserted: calendarResults.reduce((total, entry) => total + entry.inserted, 0),
     updated: calendarResults.reduce((total, entry) => total + entry.updated, 0),
     cancelled: calendarResults.reduce((total, entry) => total + entry.cancelled, 0),
+    invalidEventsSkipped: calendarResults.reduce(
+      (total, entry) => total + (entry.invalidEventsSkipped || 0),
+      0
+    ),
     fetchedItems: calendarResults.reduce((total, entry) => total + (entry.fetchedItems || 0), 0),
     fullSync: calendarResults.some((entry) => entry.fullSync),
     syncTokenUpdated: calendarResults.some((entry) => entry.syncTokenUpdated),
@@ -1420,6 +1433,7 @@ app.post('/api/google/sync', requireAuth, async (req, res) => {
         allowAllCalendars,
         calendarTargetCount: result.calendarTargetCount || 0,
         fetchedItems: result.fetchedItems || 0,
+        invalidEventsSkipped: result.invalidEventsSkipped || 0,
         failedCalendars: result.failedCalendars || [],
         totalStoredEvents: totalCountResult.rows[0]?.count ?? 0,
         windowEventCount: windowCount,
@@ -1438,6 +1452,7 @@ app.post('/api/google/sync', requireAuth, async (req, res) => {
       inserted: result.inserted,
       updated: result.updated,
       cancelled: result.cancelled,
+      invalidEventsSkipped: result.invalidEventsSkipped || 0,
       fetchedItems: result.fetchedItems,
       syncTokenUpdated: result.syncTokenUpdated,
       calendars: result.calendars,
