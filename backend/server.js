@@ -10,6 +10,14 @@ const pgSession = require('connect-pg-simple')(session);
 const { computeAvailabilityBlocks } = require('./algorithm/index.cjs');
 const { syncGoogleEvents, listGoogleCalendars } = require('./services/googleCalendar');
 const {
+  syncCalendarForUserRobust,
+  syncGroupMembers,
+  classifySyncFailure
+} = require('./services/syncCoordinator');
+const { repairCalendarsForUser } = require('./services/syncRepair');
+const { normalizeErrorPayload, sendError } = require('./lib/apiError');
+const { attachRequestId, logRequestCompletion } = require('./lib/requestId');
+const {
   computeInviteExpiry,
   buildInviteToken,
   parseInviteToken
@@ -36,6 +44,8 @@ const isProduction = process.env.NODE_ENV === 'production';
 
 app.use(express.json());
 app.set('trust proxy', 1);
+app.use(attachRequestId);
+app.use(logRequestCompletion());
 
 app.use(
   session({
@@ -58,6 +68,26 @@ app.use(
 );
 
 app.use(express.static(path.join(__dirname, '..', 'frontend'), { index: false }));
+
+app.use((req, res, next) => {
+  const originalJson = res.json.bind(res);
+  const isApiRoute = req.path.startsWith('/api') || req.path.startsWith('/test');
+
+  res.json = (body) => {
+    if (
+      isApiRoute &&
+      res.statusCode >= 400 &&
+      body &&
+      typeof body === 'object' &&
+      Object.prototype.hasOwnProperty.call(body, 'error')
+    ) {
+      return originalJson(normalizeErrorPayload(body, res.statusCode, req.requestId));
+    }
+    return originalJson(body);
+  };
+
+  next();
+});
 
 const defaultRedirectUri = isProduction
   ? `https://${process.env.RENDER_EXTERNAL_HOSTNAME || 'YOUR-APP-NAME.onrender.com'}/oauth2callback`
@@ -608,20 +638,15 @@ async function buildParticipantsWithPetitions(groupId, windowStartMs, windowEndM
   const memberIds = members.map((member) => member.id);
 
   if (process.env.NODE_ENV !== 'test') {
-    await Promise.all(
-      members.map((member) =>
-        syncCalendarForUser({
-          userId: member.id,
-          refreshToken: member.google_refresh_token,
-          gcalId: 'primary',
-          force: false,
-          includeAllCalendars: parseBooleanParam(
-            process.env.GOOGLE_SYNC_ALL_CALENDARS_DEFAULT,
-            false
-          )
-        })
+    await syncGroupMembers({
+      members,
+      gcalId: 'primary',
+      force: false,
+      includeAllCalendars: parseBooleanParam(
+        process.env.GOOGLE_SYNC_ALL_CALENDARS_DEFAULT,
+        false
       )
-    );
+    });
   }
 
   const participantsById = new Map(
@@ -1355,8 +1380,13 @@ app.get('/api/groups/:groupId/availability', requireAuth, requireGroupMember, as
     });
     return res.json(blocks);
   } catch (error) {
-    if (error.code === 'NO_REFRESH_TOKEN') {
-      return res.status(400).json({ error: 'One or more members need to re-authenticate.' });
+    if (error.code === 'MEMBER_SYNC_REAUTH_REQUIRED') {
+      return res.status(409).json({
+        error: error.message || 'One or more members need to reconnect Google Calendar.',
+        code: 'MEMBER_SYNC_REAUTH_REQUIRED',
+        retryable: false,
+        details: error.details || null
+      });
     }
     console.error('Error computing availability', error);
     return res.status(500).json({ error: 'Failed to compute availability' });
@@ -1388,12 +1418,12 @@ app.post('/api/google/sync', requireAuth, async (req, res) => {
     const user = await db.getUserById(req.session.userId);
     if (!user || !user.google_refresh_token) {
       return res.status(401).json({
-        error: 'Google Calendar access missing/expired. Please log out and log in with Google again.',
-        code: 'NO_REFRESH_TOKEN'
+        error: 'Google Calendar access missing/expired. Please reconnect Google Calendar.',
+        code: 'GOOGLE_REAUTH_REQUIRED'
       });
     }
 
-    const result = await syncCalendarForUser({
+    const result = await syncCalendarForUserRobust({
       userId: req.session.userId,
       refreshToken: user.google_refresh_token,
       gcalId: calendarId,
@@ -1455,12 +1485,23 @@ app.post('/api/google/sync', requireAuth, async (req, res) => {
       invalidEventsSkipped: result.invalidEventsSkipped || 0,
       fetchedItems: result.fetchedItems,
       syncTokenUpdated: result.syncTokenUpdated,
+      attempts: result.attempts || 0,
       calendars: result.calendars,
       failedCalendars: result.failedCalendars,
       diagnostics
     });
   } catch (error) {
-    const classified = classifyGoogleSyncFailure(error);
+    const classified =
+      error?.status && error?.code
+        ? {
+            code: error.code,
+            message: error.message,
+            details: error.details || null,
+            retryable: Boolean(error.retryable),
+            httpStatus: Number(error.status)
+          }
+        : classifySyncFailure(error);
+
     console.error('Error syncing Google calendar', {
       userId: req.session.userId,
       code: classified.code,
@@ -1468,28 +1509,81 @@ app.post('/api/google/sync', requireAuth, async (req, res) => {
       error: error?.message
     });
 
-    if (classified.code === 'NO_REFRESH_TOKEN' || classified.code === 'INVALID_GRANT' || classified.code === 'GOOGLE_AUTH_EXPIRED') {
-      req.session.destroy(() => {});
-      return res.status(401).json({
-        error: 'Authentication expired. Please log in again.',
-        code: classified.code,
-        details: classified.details || null
-      });
-    }
-
-    if (classified.code === 'GOOGLE_CLIENT_CONFIG_ERROR') {
-      return res.status(500).json({
-        error: classified.message,
-        code: classified.code,
-        details: classified.details || null
-      });
-    }
-
-    return res.status(502).json({
+    return res.status(classified.httpStatus || 502).json({
       error: classified.message || 'Failed to sync Google calendar',
       code: classified.code,
+      retryable: classified.retryable,
       details: classified.details || null,
       failedCalendars: error?.failedCalendars || []
+    });
+  }
+});
+
+app.get('/api/google/sync/status', requireAuth, async (req, res) => {
+  const calendarId =
+    typeof req.query?.calendarId === 'string' && req.query.calendarId.trim()
+      ? req.query.calendarId.trim()
+      : null;
+
+  const calendars = await db.listCalendarSyncStatusForUser({
+    userId: req.session.userId,
+    gcalId: calendarId
+  });
+
+  return res.json({
+    calendars: calendars.map((row) => ({
+      calendarDbId: row.calendar_id,
+      calendarId: row.gcal_id,
+      calendarName: row.calendar_name,
+      lastSyncedAt: row.last_synced_at,
+      lastSucceededAt: row.last_succeeded_at,
+      lastAttemptedAt: row.last_attempted_at,
+      lastErrorCode: row.last_error_code,
+      needsReauth: Boolean(row.needs_reauth),
+      inProgress: Boolean(row.in_progress),
+      inProgressStartedAt: row.in_progress_started_at,
+      consecutiveFailures: Number(row.consecutive_failures || 0),
+      lastErrorDetails: row.last_error_details || null
+    }))
+  });
+});
+
+app.post('/api/google/sync/repair', requireAuth, async (req, res) => {
+  const calendarId =
+    typeof req.body?.calendarId === 'string' && req.body.calendarId.trim()
+      ? req.body.calendarId.trim()
+      : null;
+  const mode =
+    typeof req.body?.mode === 'string' && req.body.mode.trim()
+      ? req.body.mode.trim().toUpperCase()
+      : 'FULL_RESYNC';
+
+  try {
+    const details = await repairCalendarsForUser({
+      userId: req.session.userId,
+      gcalId: calendarId,
+      mode
+    });
+
+    return res.json({
+      ok: true,
+      queuedOrExecuted: true,
+      details
+    });
+  } catch (error) {
+    if (error?.status && error?.code) {
+      return res.status(error.status).json({
+        error: error.message,
+        code: error.code,
+        retryable: Boolean(error.retryable),
+        details: error.details || null
+      });
+    }
+
+    console.error('Error repairing Google sync state', error);
+    return res.status(500).json({
+      error: 'Failed to repair Google sync state',
+      code: 'SYNC_REPAIR_FAILED'
     });
   }
 });
@@ -1770,6 +1864,22 @@ app.get('/test-session', (req, res) => {
     userId: req.session.userId,
     isAuthenticated: req.session.isAuthenticated,
     fullSession: req.session
+  });
+});
+
+app.use((error, req, res, _next) => {
+  if (res.headersSent) return;
+  console.error('Unhandled API error', {
+    requestId: req.requestId || null,
+    method: req.method,
+    path: req.originalUrl,
+    message: error?.message
+  });
+  sendError(res, error, {
+    status: 500,
+    code: 'INTERNAL_ERROR',
+    message: 'Unexpected server error',
+    retryable: true
   });
 });
 

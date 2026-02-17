@@ -136,20 +136,23 @@ describe('outbox/worker and runner', () => {
 
   test('backoff helpers compute delay and next attempt', () => {
     const randomSpy = jest.spyOn(Math, 'random').mockReturnValue(0);
-    const delay = worker.computeBackoffDelayMs({
-      attemptCount: 2,
-      baseDelayMs: 1000,
-      capDelayMs: 10_000,
-      jitterMaxMs: 250
-    });
-    expect(delay).toBe(4000);
+    try {
+      const delay = worker.computeBackoffDelayMs({
+        attemptCount: 2,
+        baseDelayMs: 1000,
+        capDelayMs: 10_000,
+        jitterMaxMs: 250
+      });
+      expect(delay).toBe(4000);
 
-    const nextAttempt = worker.getNextAttemptAt({
-      attemptCount: 2,
-      now: new Date('2026-01-01T00:00:00Z')
-    });
-    expect(nextAttempt.getTime()).toBeGreaterThan(Date.parse('2026-01-01T00:00:04Z'));
-    randomSpy.mockRestore();
+      const nextAttempt = worker.getNextAttemptAt({
+        attemptCount: 2,
+        now: new Date('2026-01-01T00:00:00Z')
+      });
+      expect(nextAttempt.getTime()).toBeGreaterThanOrEqual(Date.parse('2026-01-01T00:00:04Z'));
+    } finally {
+      randomSpy.mockRestore();
+    }
   });
 
   test('processOutboxBatch marks rows SENT on success', async () => {

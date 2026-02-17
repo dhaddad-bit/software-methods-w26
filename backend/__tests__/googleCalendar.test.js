@@ -5,7 +5,14 @@ const path = require('path');
 const vm = require('vm');
 
 const googleCalendar = require('../services/googleCalendar');
-const { normalizeEventsToIntervals, fetchBusyIntervalsForUser } = googleCalendar;
+const {
+  normalizeEventsToIntervals,
+  fetchBusyIntervalsForUser,
+  getGoogleErrorInfo,
+  isGoogleAuthError,
+  isRetryableGoogleError,
+  normalizeGoogleEventForStorage
+} = googleCalendar;
 
 function loadParseEventTime() {
   const filePath = path.join(__dirname, '..', 'services', 'googleCalendar.js');
@@ -67,4 +74,65 @@ test('fetchBusyIntervalsForUser throws NO_REFRESH_TOKEN before any API call', as
 
   expect(spy).not.toHaveBeenCalled();
   spy.mockRestore();
+});
+
+test('Google error helpers classify auth and retryable failures', () => {
+  const authError = new Error('invalid_grant');
+  authError.response = {
+    status: 401,
+    data: {
+      error: 'invalid_grant',
+      error_description: 'Token revoked'
+    }
+  };
+
+  expect(getGoogleErrorInfo(authError)).toMatchObject({
+    status: 401,
+    message: 'Token revoked'
+  });
+  expect(isGoogleAuthError(authError)).toBe(true);
+  expect(isRetryableGoogleError(authError)).toBe(false);
+
+  const retryable = new Error('upstream');
+  retryable.response = {
+    status: 503,
+    data: {
+      error: {
+        message: 'service unavailable'
+      }
+    }
+  };
+
+  expect(isRetryableGoogleError(retryable)).toBe(true);
+});
+
+test('normalizeGoogleEventForStorage handles confirmed, cancelled, and invalid events', () => {
+  const confirmed = normalizeGoogleEventForStorage({
+    id: 'evt-confirmed',
+    summary: 'Planning',
+    start: { dateTime: '2026-03-01T10:00:00Z' },
+    end: { dateTime: '2026-03-01T11:00:00Z' }
+  });
+  expect(confirmed).toMatchObject({
+    providerEventId: 'evt-confirmed',
+    title: 'Planning',
+    status: 'confirmed',
+    isAllDay: false
+  });
+
+  const cancelled = normalizeGoogleEventForStorage({
+    id: 'evt-cancelled',
+    status: 'cancelled'
+  });
+  expect(cancelled).toMatchObject({
+    providerEventId: 'evt-cancelled',
+    status: 'cancelled'
+  });
+
+  const invalid = normalizeGoogleEventForStorage({
+    id: 'evt-invalid',
+    start: { dateTime: 'not-a-date' },
+    end: { dateTime: '2026-03-01T11:00:00Z' }
+  });
+  expect(invalid).toBeNull();
 });

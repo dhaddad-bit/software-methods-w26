@@ -13,7 +13,8 @@ const {
   sortIdValues,
   collectDryRunReport,
   applyCleanup,
-  runCleanup
+  runCleanup,
+  main
 } = require('../maintenance/cleanup');
 
 beforeEach(() => {
@@ -69,6 +70,7 @@ test('cleanup selectors include optional cancelled events based on policy', () =
 
 test('cleanup argument parsing and deterministic id sorting', () => {
   expect(parseArgs([])).toMatchObject({ dryRun: true, apply: false, json: false });
+  expect(parseArgs(['--dry-run'])).toMatchObject({ dryRun: true, apply: false, json: false });
   expect(parseArgs(['--apply', '--confirm', 'APPLY_CLEANUP', '--json'])).toMatchObject({
     apply: true,
     confirm: 'APPLY_CLEANUP',
@@ -170,4 +172,51 @@ test('runCleanup enforces confirmation token and supports dry-run json output', 
   const parsed = JSON.parse(output);
   expect(parsed.mode).toBe('dry-run');
   expect(Array.isArray(parsed.entries)).toBe(true);
+});
+
+test('runCleanup returns formatted text report when json flag is disabled', async () => {
+  const queryFn = jest
+    .fn()
+    .mockResolvedValueOnce({ rows: [{ count: 1 }] })
+    .mockResolvedValueOnce({ rows: [{ invite_id: 7 }] })
+    .mockResolvedValueOnce({ rows: [{ count: 0 }] })
+    .mockResolvedValueOnce({ rows: [] })
+    .mockResolvedValueOnce({ rows: [{ count: 0 }] })
+    .mockResolvedValueOnce({ rows: [] })
+    .mockResolvedValueOnce({ rows: [{ count: 0 }] })
+    .mockResolvedValueOnce({ rows: [] });
+
+  const output = await runCleanup({
+    args: {
+      dryRun: true,
+      apply: false,
+      confirm: '',
+      json: false
+    },
+    queryFn
+  });
+
+  expect(output).toContain('mode=dry-run');
+  expect(output).toContain('expired_invites: count=1 sample_ids=[7]');
+});
+
+test('cleanup main writes output to stdout', async () => {
+  const originalArgv = process.argv;
+  process.argv = ['node', 'cleanup.js', '--dry-run'];
+
+  db.query.mockImplementation(async (sql) => {
+    if (String(sql).toLowerCase().includes('count')) {
+      return { rows: [{ count: 0 }] };
+    }
+    return { rows: [] };
+  });
+
+  const writeSpy = jest.spyOn(process.stdout, 'write').mockImplementation(() => true);
+  try {
+    await main();
+    expect(writeSpy).toHaveBeenCalledWith(expect.stringContaining('mode=dry-run'));
+  } finally {
+    writeSpy.mockRestore();
+    process.argv = originalArgv;
+  }
 });

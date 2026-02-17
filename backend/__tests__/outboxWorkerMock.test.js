@@ -62,15 +62,18 @@ test('outbox worker helper functions use defaults and env overrides', () => {
   expect(getMaxOutboxAttempts()).toBe(5);
 
   const randomSpy = jest.spyOn(Math, 'random').mockReturnValue(0);
-  expect(
-    computeBackoffDelayMs({
-      attemptCount: 2,
-      baseDelayMs: 1000,
-      capDelayMs: 10_000,
-      jitterMaxMs: 250
-    })
-  ).toBe(4000);
-  randomSpy.mockRestore();
+  try {
+    expect(
+      computeBackoffDelayMs({
+        attemptCount: 2,
+        baseDelayMs: 1000,
+        capDelayMs: 10_000,
+        jitterMaxMs: 250
+      })
+    ).toBe(4000);
+  } finally {
+    randomSpy.mockRestore();
+  }
 
   const nextAttempt = getNextAttemptAt({
     attemptCount: 1,

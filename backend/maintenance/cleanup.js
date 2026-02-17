@@ -136,6 +136,7 @@ async function main() {
   process.stdout.write(`${output}\n`);
 }
 
+/* istanbul ignore next */
 if (require.main === module) {
   main().catch((error) => {
     process.stderr.write(`${error?.stack || error}\n`);

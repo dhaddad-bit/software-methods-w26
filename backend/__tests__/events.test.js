@@ -1,7 +1,44 @@
 process.env.NODE_ENV = 'test';
 
 jest.mock('../services/googleCalendar', () => ({
-  syncGoogleEvents: jest.fn()
+  syncGoogleEvents: jest.fn(),
+  listGoogleCalendars: jest.fn(async () => []),
+  normalizeGoogleEventForStorage: jest.fn((event) => {
+    if (!event?.id) return null;
+    if (event.status === 'cancelled') {
+      return {
+        providerEventId: event.id,
+        status: 'cancelled'
+      };
+    }
+
+    return {
+      providerEventId: event.id,
+      iCalUID: event.iCalUID || null,
+      recurringEventId: event.recurringEventId || null,
+      originalStartTime: event.originalStartTime?.dateTime || event.originalStartTime?.date || null,
+      title: event.summary || null,
+      start: event.start?.dateTime || (event.start?.date ? `${event.start.date}T00:00:00Z` : null),
+      end: event.end?.dateTime || (event.end?.date ? `${event.end.date}T00:00:00Z` : null),
+      status: event.status || 'confirmed',
+      providerUpdatedAt: event.updated || null,
+      etag: event.etag || null,
+      isAllDay: Boolean(event.start?.date && event.end?.date),
+      eventTimeZone: event.start?.timeZone || event.end?.timeZone || null
+    };
+  }),
+  getGoogleErrorInfo: jest.fn((error) => ({
+    status: error?.response?.status || error?.status || null,
+    message: error?.message || 'error'
+  })),
+  isGoogleAuthError: jest.fn((error) => {
+    const combined = `${error?.message || ''} ${error?.response?.data?.error || ''}`.toLowerCase();
+    return combined.includes('invalid_grant') || combined.includes('invalid credentials');
+  }),
+  isRetryableGoogleError: jest.fn((error) => {
+    const status = error?.response?.status || error?.status || null;
+    return status === 429 || (typeof status === 'number' && status >= 500);
+  })
 }));
 
 const request = require('supertest');
@@ -121,4 +158,3 @@ test('POST /api/google/sync persists events, supports cancel, and preserves bloc
   const calEventCount = await db.query('SELECT COUNT(*)::int AS count FROM cal_event');
   expect(calEventCount.rows[0].count).toBe(2);
 });
-

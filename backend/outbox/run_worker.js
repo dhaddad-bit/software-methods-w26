@@ -30,6 +30,7 @@ async function main() {
   process.stdout.write(`${JSON.stringify(result)}\n`);
 }
 
+/* istanbul ignore next */
 if (require.main === module) {
   main().catch((error) => {
     process.stderr.write(`${error?.stack || error}\n`);
