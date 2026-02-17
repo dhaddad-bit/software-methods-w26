@@ -40,17 +40,19 @@ async function withTransaction(handler) {
 async function runSchemaMigrations() {
   const basePath = path.join(__dirname, 'table_initialization.sql');
   const migrationPath = path.join(__dirname, 'priority_migrations.sql');
+  const syncHardeningPath = path.join(__dirname, 'sync_hardening_migrations.sql');
   const inviteNotificationPath = path.join(__dirname, 'invite_notification_migrations.sql');
 
   const baseSql = fs.readFileSync(basePath, 'utf8');
   const migrationSql = fs.readFileSync(migrationPath, 'utf8');
+  const syncHardeningSql = fs.readFileSync(syncHardeningPath, 'utf8');
   const inviteNotificationSql = fs.readFileSync(inviteNotificationPath, 'utf8');
 
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
 
-    const statements = [baseSql, migrationSql, inviteNotificationSql]
+    const statements = [baseSql, migrationSql, syncHardeningSql, inviteNotificationSql]
       .join('\n')
       .split(';')
       .map((s) => s.trim())
@@ -1226,7 +1228,7 @@ const markOutboxFailure = async ({
     `UPDATE notification_outbox
      SET attempt_count = attempt_count + 1,
          status = CASE WHEN attempt_count + 1 >= $4 THEN 'DEAD' ELSE 'FAILED' END,
-         next_attempt_at = CASE WHEN attempt_count + 1 >= $4 THEN NULL ELSE $3 END,
+         next_attempt_at = CASE WHEN attempt_count + 1 >= $4 THEN NULL::timestamptz ELSE $3::timestamptz END,
          last_error = $2,
          updated_at = NOW()
      WHERE outbox_id = $1
@@ -1260,11 +1262,47 @@ const upsertCalendarForUser = async ({ userId, gcalId = 'primary', calendarName 
 
 const getOrCreateCalendar = upsertCalendarForUser;
 
+const CALENDAR_SYNC_STATE_SELECT_COLUMNS = `
+  calendar_id,
+  sync_token,
+  last_success_sync_token,
+  last_synced_at,
+  last_succeeded_at,
+  last_full_synced_at,
+  last_attempted_at,
+  last_error,
+  last_error_code,
+  last_error_details,
+  consecutive_failures,
+  needs_reauth,
+  in_progress,
+  in_progress_started_at,
+  updated_at
+`;
+
 const getCalendarSyncState = async (calendarId) => {
   const result = await pool.query(
-    `SELECT calendar_id, sync_token, last_synced_at, last_full_synced_at, last_error, updated_at
+    `SELECT ${CALENDAR_SYNC_STATE_SELECT_COLUMNS}
      FROM calendar_sync_state
      WHERE calendar_id = $1`,
+    [calendarId]
+  );
+  return result.rows[0] || null;
+};
+
+const getCalendarSyncStateForUpdate = async (client, calendarId) => {
+  await client.query(
+    `INSERT INTO calendar_sync_state (calendar_id)
+     VALUES ($1)
+     ON CONFLICT (calendar_id) DO NOTHING`,
+    [calendarId]
+  );
+
+  const result = await client.query(
+    `SELECT ${CALENDAR_SYNC_STATE_SELECT_COLUMNS}
+     FROM calendar_sync_state
+     WHERE calendar_id = $1
+     FOR UPDATE`,
     [calendarId]
   );
   return result.rows[0] || null;
@@ -1278,19 +1316,361 @@ const upsertCalendarSyncState = async ({
   lastError
 }) => {
   const result = await pool.query(
-    `INSERT INTO calendar_sync_state (calendar_id, sync_token, last_synced_at, last_full_synced_at, last_error)
-     VALUES ($1, $2, $3, $4, $5)
+    `INSERT INTO calendar_sync_state (
+       calendar_id,
+       sync_token,
+       last_success_sync_token,
+       last_synced_at,
+       last_succeeded_at,
+       last_full_synced_at,
+       last_attempted_at,
+       last_error,
+       last_error_code,
+       last_error_details,
+       consecutive_failures,
+       needs_reauth,
+       in_progress,
+       in_progress_started_at
+     )
+     VALUES (
+       $1,
+       $2,
+       CASE WHEN $5 IS NULL THEN $2 ELSE NULL END,
+       $3,
+       CASE WHEN $5 IS NULL THEN $3 ELSE NULL END,
+       $4,
+       NOW(),
+       $5,
+       CASE WHEN $5 IS NULL THEN NULL ELSE 'SYNC_FAILED' END,
+       NULL,
+       CASE WHEN $5 IS NULL THEN 0 ELSE 1 END,
+       FALSE,
+       FALSE,
+       NULL
+     )
      ON CONFLICT (calendar_id)
      DO UPDATE SET
        sync_token = EXCLUDED.sync_token,
+       last_success_sync_token = CASE
+         WHEN EXCLUDED.last_error IS NULL THEN EXCLUDED.sync_token
+         ELSE calendar_sync_state.last_success_sync_token
+       END,
        last_synced_at = EXCLUDED.last_synced_at,
-       last_full_synced_at = EXCLUDED.last_full_synced_at,
+       last_succeeded_at = CASE
+         WHEN EXCLUDED.last_error IS NULL THEN EXCLUDED.last_synced_at
+         ELSE calendar_sync_state.last_succeeded_at
+       END,
+       last_full_synced_at = COALESCE(EXCLUDED.last_full_synced_at, calendar_sync_state.last_full_synced_at),
+       last_attempted_at = NOW(),
        last_error = EXCLUDED.last_error,
+       last_error_code = CASE
+         WHEN EXCLUDED.last_error IS NULL THEN NULL
+         ELSE EXCLUDED.last_error_code
+       END,
+       last_error_details = CASE
+         WHEN EXCLUDED.last_error IS NULL THEN NULL
+         ELSE EXCLUDED.last_error_details
+       END,
+       consecutive_failures = CASE
+         WHEN EXCLUDED.last_error IS NULL THEN 0
+         ELSE calendar_sync_state.consecutive_failures + 1
+       END,
+       needs_reauth = FALSE,
+       in_progress = FALSE,
+       in_progress_started_at = NULL,
        updated_at = NOW()
-     RETURNING calendar_id, sync_token, last_synced_at, last_full_synced_at, last_error, updated_at`,
+     RETURNING ${CALENDAR_SYNC_STATE_SELECT_COLUMNS}`,
     [calendarId, syncToken ?? null, lastSyncedAt ?? null, lastFullSyncedAt ?? null, lastError ?? null]
   );
   return result.rows[0];
+};
+
+const markCalendarSyncStarted = async ({
+  calendarId,
+  attemptedAt = new Date(),
+  startedAt = new Date()
+}) => {
+  const result = await pool.query(
+    `INSERT INTO calendar_sync_state (
+       calendar_id,
+       last_attempted_at,
+       in_progress,
+       in_progress_started_at,
+       last_error,
+       last_error_code,
+       last_error_details
+     )
+     VALUES ($1, $2, TRUE, $3, NULL, NULL, NULL)
+     ON CONFLICT (calendar_id)
+     DO UPDATE SET
+       last_attempted_at = EXCLUDED.last_attempted_at,
+       in_progress = TRUE,
+       in_progress_started_at = EXCLUDED.in_progress_started_at,
+       last_error = NULL,
+       last_error_code = NULL,
+       last_error_details = NULL,
+       updated_at = NOW()
+     RETURNING ${CALENDAR_SYNC_STATE_SELECT_COLUMNS}`,
+    [calendarId, attemptedAt, startedAt]
+  );
+  return result.rows[0] || null;
+};
+
+const markCalendarSyncSucceeded = async ({
+  calendarId,
+  syncToken,
+  lastSyncedAt = new Date(),
+  lastFullSyncedAt = null
+}) => {
+  const result = await pool.query(
+    `INSERT INTO calendar_sync_state (
+       calendar_id,
+       sync_token,
+       last_success_sync_token,
+       last_synced_at,
+       last_succeeded_at,
+       last_full_synced_at,
+       last_attempted_at,
+       last_error,
+       last_error_code,
+       last_error_details,
+       consecutive_failures,
+       needs_reauth,
+       in_progress,
+       in_progress_started_at
+     )
+     VALUES (
+       $1,
+       $2,
+       $2,
+       $3,
+       $3,
+       $4,
+       $3,
+       NULL,
+       NULL,
+       NULL,
+       0,
+       FALSE,
+       FALSE,
+       NULL
+     )
+     ON CONFLICT (calendar_id)
+     DO UPDATE SET
+       sync_token = EXCLUDED.sync_token,
+       last_success_sync_token = EXCLUDED.last_success_sync_token,
+       last_synced_at = EXCLUDED.last_synced_at,
+       last_succeeded_at = EXCLUDED.last_succeeded_at,
+       last_full_synced_at = COALESCE(EXCLUDED.last_full_synced_at, calendar_sync_state.last_full_synced_at),
+       last_attempted_at = EXCLUDED.last_attempted_at,
+       last_error = NULL,
+       last_error_code = NULL,
+       last_error_details = NULL,
+       consecutive_failures = 0,
+       needs_reauth = FALSE,
+       in_progress = FALSE,
+       in_progress_started_at = NULL,
+       updated_at = NOW()
+     RETURNING ${CALENDAR_SYNC_STATE_SELECT_COLUMNS}`,
+    [calendarId, syncToken ?? null, lastSyncedAt, lastFullSyncedAt]
+  );
+  return result.rows[0] || null;
+};
+
+const markCalendarSyncFailed = async ({
+  calendarId,
+  lastError = null,
+  lastErrorCode = null,
+  lastErrorDetails = null,
+  needsReauth = false,
+  attemptedAt = new Date()
+}) => {
+  const result = await pool.query(
+    `INSERT INTO calendar_sync_state (
+       calendar_id,
+       last_attempted_at,
+       last_error,
+       last_error_code,
+       last_error_details,
+       consecutive_failures,
+       needs_reauth,
+       in_progress,
+       in_progress_started_at
+     )
+     VALUES ($1, $2, $3, $4, $5::jsonb, 1, $6, FALSE, NULL)
+     ON CONFLICT (calendar_id)
+     DO UPDATE SET
+       last_attempted_at = EXCLUDED.last_attempted_at,
+       last_error = EXCLUDED.last_error,
+       last_error_code = EXCLUDED.last_error_code,
+       last_error_details = EXCLUDED.last_error_details,
+       consecutive_failures = calendar_sync_state.consecutive_failures + 1,
+       needs_reauth = EXCLUDED.needs_reauth,
+       in_progress = FALSE,
+       in_progress_started_at = NULL,
+       updated_at = NOW()
+     RETURNING ${CALENDAR_SYNC_STATE_SELECT_COLUMNS}`,
+    [
+      calendarId,
+      attemptedAt,
+      lastError,
+      lastErrorCode,
+      lastErrorDetails ? JSON.stringify(lastErrorDetails) : null,
+      Boolean(needsReauth)
+    ]
+  );
+  return result.rows[0] || null;
+};
+
+const resetCalendarSyncState = async ({ calendarId, clearSyncToken = true }) => {
+  const result = await pool.query(
+    `INSERT INTO calendar_sync_state (
+       calendar_id,
+       sync_token,
+       last_success_sync_token,
+       last_error,
+       last_error_code,
+       last_error_details,
+       consecutive_failures,
+       needs_reauth,
+       in_progress,
+       in_progress_started_at,
+       last_attempted_at
+     )
+     VALUES ($1, NULL, NULL, NULL, NULL, NULL, 0, FALSE, FALSE, NULL, NOW())
+     ON CONFLICT (calendar_id)
+     DO UPDATE SET
+       sync_token = CASE WHEN $2 THEN NULL ELSE calendar_sync_state.sync_token END,
+       last_success_sync_token = CASE
+         WHEN $2 THEN NULL
+         ELSE calendar_sync_state.last_success_sync_token
+       END,
+       last_error = NULL,
+       last_error_code = NULL,
+       last_error_details = NULL,
+       consecutive_failures = 0,
+       needs_reauth = FALSE,
+       in_progress = FALSE,
+       in_progress_started_at = NULL,
+       last_attempted_at = NOW(),
+       updated_at = NOW()
+     RETURNING ${CALENDAR_SYNC_STATE_SELECT_COLUMNS}`,
+    [calendarId, Boolean(clearSyncToken)]
+  );
+  return result.rows[0] || null;
+};
+
+const listCalendarSyncStatusForUser = async ({ userId, gcalId = null }) => {
+  const result = await pool.query(
+    `SELECT c.calendar_id,
+            c.gcal_id,
+            c.calendar_name,
+            s.last_synced_at,
+            s.last_succeeded_at,
+            s.last_attempted_at,
+            s.last_error_code,
+            s.last_error_details,
+            s.consecutive_failures,
+            s.needs_reauth,
+            s.in_progress,
+            s.in_progress_started_at
+     FROM calendar c
+     LEFT JOIN calendar_sync_state s ON s.calendar_id = c.calendar_id
+     WHERE c.user_id = $1
+       AND ($2::text IS NULL OR c.gcal_id = $2)
+     ORDER BY c.calendar_id`,
+    [userId, gcalId]
+  );
+  return result.rows;
+};
+
+const createCalendarSyncRun = async ({
+  calendarId,
+  attempt = 1,
+  syncTokenIn = null,
+  startedAt = new Date()
+}) => {
+  const result = await pool.query(
+    `INSERT INTO calendar_sync_run (calendar_id, started_at, status, attempt, sync_token_in)
+     VALUES ($1, $2, 'IN_PROGRESS', $3, $4)
+     RETURNING run_id,
+               calendar_id,
+               started_at,
+               finished_at,
+               status,
+               attempt,
+               sync_token_in,
+               sync_token_out,
+               items_seen,
+               items_upserted,
+               items_cancelled,
+               error_code,
+               error_payload`,
+    [calendarId, startedAt, attempt, syncTokenIn]
+  );
+  return result.rows[0] || null;
+};
+
+const completeCalendarSyncRun = async ({
+  runId,
+  status,
+  finishedAt = new Date(),
+  syncTokenOut = null,
+  itemsSeen = 0,
+  itemsUpserted = 0,
+  itemsCancelled = 0,
+  errorCode = null,
+  errorPayload = null
+}) => {
+  const result = await pool.query(
+    `UPDATE calendar_sync_run
+     SET status = $2,
+         finished_at = $3,
+         sync_token_out = $4,
+         items_seen = $5,
+         items_upserted = $6,
+         items_cancelled = $7,
+         error_code = $8,
+         error_payload = $9::jsonb
+     WHERE run_id = $1
+     RETURNING run_id,
+               calendar_id,
+               started_at,
+               finished_at,
+               status,
+               attempt,
+               sync_token_in,
+               sync_token_out,
+               items_seen,
+               items_upserted,
+               items_cancelled,
+               error_code,
+               error_payload`,
+    [
+      runId,
+      status,
+      finishedAt,
+      syncTokenOut,
+      itemsSeen,
+      itemsUpserted,
+      itemsCancelled,
+      errorCode,
+      errorPayload ? JSON.stringify(errorPayload) : null
+    ]
+  );
+  return result.rows[0] || null;
+};
+
+const listUserCalendars = async ({ userId, gcalId = null }) => {
+  const result = await pool.query(
+    `SELECT calendar_id, gcal_id, calendar_name
+     FROM calendar
+     WHERE user_id = $1
+       AND ($2::text IS NULL OR gcal_id = $2)
+     ORDER BY calendar_id`,
+    [userId, gcalId]
+  );
+  return result.rows;
 };
 
 const upsertCalEvents = async (calendarId, events) => {
@@ -1320,12 +1700,14 @@ const upsertCalEvents = async (calendarId, events) => {
            event_name,
            event_start,
            event_end,
+           is_all_day,
+           event_timezone,
            status,
            provider_updated_at,
            etag,
            last_synced_at
          )
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW())
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,NOW())
          ON CONFLICT (calendar_id, provider_event_id)
          DO UPDATE SET
            ical_uid = EXCLUDED.ical_uid,
@@ -1334,6 +1716,8 @@ const upsertCalEvents = async (calendarId, events) => {
            event_name = EXCLUDED.event_name,
            event_start = EXCLUDED.event_start,
            event_end = EXCLUDED.event_end,
+           is_all_day = EXCLUDED.is_all_day,
+           event_timezone = EXCLUDED.event_timezone,
            status = EXCLUDED.status,
            provider_updated_at = EXCLUDED.provider_updated_at,
            etag = EXCLUDED.etag,
@@ -1348,6 +1732,8 @@ const upsertCalEvents = async (calendarId, events) => {
           event.title ?? null,
           event.start,
           event.end,
+          Boolean(event.isAllDay),
+          event.eventTimeZone ?? null,
           event.status ?? 'confirmed',
           event.providerUpdatedAt ?? null,
           event.etag ?? null
@@ -1668,7 +2054,16 @@ module.exports = {
   upsertCalendarForUser,
   getOrCreateCalendar,
   getCalendarSyncState,
+  getCalendarSyncStateForUpdate,
   upsertCalendarSyncState,
+  markCalendarSyncStarted,
+  markCalendarSyncSucceeded,
+  markCalendarSyncFailed,
+  resetCalendarSyncState,
+  listCalendarSyncStatusForUser,
+  createCalendarSyncRun,
+  completeCalendarSyncRun,
+  listUserCalendars,
   upsertCalEvents,
   markCalEventsCancelled,
   listGoogleEventsForUser,

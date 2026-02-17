@@ -14,6 +14,7 @@ function checkDbSafety() {
 async function runMigrations() {
   const sqlPath = path.join(__dirname, '..', 'db', 'table_initialization.sql');
   const migrationPath = path.join(__dirname, '..', 'db', 'priority_migrations.sql');
+  const syncHardeningPath = path.join(__dirname, '..', 'db', 'sync_hardening_migrations.sql');
   const inviteNotificationPath = path.join(
     __dirname,
     '..',
@@ -23,6 +24,7 @@ async function runMigrations() {
   const sqlParts = [
     fs.readFileSync(sqlPath, 'utf8'),
     fs.readFileSync(migrationPath, 'utf8'),
+    fs.readFileSync(syncHardeningPath, 'utf8'),
     fs.readFileSync(inviteNotificationPath, 'utf8')
   ];
 
@@ -61,7 +63,7 @@ async function runMigrations() {
 
 async function resetDb() {
   await db.query(
-    'TRUNCATE TABLE notification_outbox, notifications, group_invites, cal_event, calendar_sync_state, calendar, user_busy_block, petition_responses, petitions, group_memberships, groups, users RESTART IDENTITY CASCADE'
+    'TRUNCATE TABLE calendar_sync_run, notification_outbox, notifications, group_invites, cal_event, calendar_sync_state, calendar, user_busy_block, petition_responses, petitions, group_memberships, groups, users RESTART IDENTITY CASCADE'
   );
 }
 

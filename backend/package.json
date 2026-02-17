@@ -11,7 +11,8 @@
     "test:coverage:ci": "npm run test:coverage && npm run coverage:check-regression",
     "cleanup:dry-run": "node ./maintenance/cleanup.js --dry-run",
     "cleanup:apply": "node ./maintenance/cleanup.js --apply --confirm APPLY_CLEANUP",
-    "outbox:worker": "node ./outbox/run_worker.js"
+    "outbox:worker": "node ./outbox/run_worker.js",
+    "sync:repair": "node ./scripts/repair_calendar_sync.js"
   },
   "dependencies": {
     "connect-pg-simple": "^10.0.0",
